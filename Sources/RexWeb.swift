@@ -228,18 +228,38 @@ enum Rex {
     }
   }
 
-  /// Read one line of `rex events --json`: whether it can change a layout, and the mark if it is a marked pane's
-  /// title change. Clients joining and leaving can't change a layout, and every rex call RexWeb makes is one.
-  static func event(_ line: Data) -> (layout: Bool, mark: Mark?) {
-    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return (false, nil) }
-    let p = o["payload"] as? [String: Any], event = p?["event"] as? [String: Any]
-    let type = event?["type"] as? String ?? o["type"] as? String ?? ""
-    guard let s = p?["session_id"] as? String, let e = event?["payload"] as? [String: Any],
-          e["name"] as? String == "title_changed", let b = e["block_id"] as? String,
-          let url = mark(title: (e["payload"] as? [String: Any])?["title"] as? String ?? "") else {
-      return (!type.hasPrefix("client_"), nil)
+  /// Read one line of `rex events --json`: the session whose layout it may change, and the mark if it is a marked
+  /// pane's title change. `cli` collects the CLI clients that have joined, as every rex call RexWeb makes does; any
+  /// other client connecting to a session or leaving it, such as the Rex app, can change which of its panes show.
+  static func event(_ line: Data, cli: inout Set<String>) -> (session: String?, mark: Mark?) {
+    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return (nil, nil) }
+    let p = o["payload"] as? [String: Any] ?? [:]
+    switch o["type"] as? String {
+    case "client_joined":
+      let c = p["client"] as? [String: Any]
+      if (c?["info"] as? [String: Any])?["kind"] as? String == "cli", let id = c?["client_id"] as? String { cli.insert(id) }
+    case "client_left":
+      if let id = p["client_id"] as? String { cli.remove(id) }
+    case "session_destroyed":
+      return (p["session_id"] as? String, nil)
+    case "session_event":
+      guard let s = p["session_id"] as? String, let e = p["event"] as? [String: Any] else { break }
+      let ep = e["payload"] as? [String: Any] ?? [:]
+      switch e["type"] as? String {
+      case "session_view_changed", "active_window_changed", "block_closed", "window_closed":
+        return (s, nil)
+      case "client_connected", "client_disconnected":
+        if !cli.contains(ep["client_id"] as? String ?? "") { return (s, nil) }
+      case "block_event":
+        if ep["name"] as? String == "title_changed", let b = ep["block_id"] as? String,
+           let url = mark(title: (ep["payload"] as? [String: Any])?["title"] as? String ?? "") {
+          return (nil, Mark(session: s, block: b, url: url))
+        }
+      default: break
+      }
+    default: break
     }
-    return (true, Mark(session: s, block: b, url: url))
+    return (nil, nil)
   }
 
   static var version: String?
@@ -729,23 +749,23 @@ final class Tracker {
     }
   }
 
-  /// Stream a server's events: each one refreshes that server's panels, and on another host a marked, labelled pane
-  /// becomes a panel. Each time a host's stream starts, a scan adopts the marked panes that already exist there.
+  /// Stream a server's events: a layout change refreshes that session's panels, and on another host a marked,
+  /// labelled pane becomes a panel. Each time a host's stream starts, a scan adopts the marked panes already there.
   /// Local panes register themselves through `rexweb-pane`.
   func startEvents(_ host: String?) {
     let p = Rex.process(["events", "--all", "--json"], host: host)
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
-    var buf = Data()
+    var buf = Data(), cli = Set<String>()
     out.fileHandleForReading.readabilityHandler = { [weak self] h in
       let d = h.availableData
       if d.isEmpty { h.readabilityHandler = nil; return }
       buf.append(d)
-      var marks: [Rex.Mark] = [], layout = false
+      var marks: [Rex.Mark] = [], sessions = Set<String>()
       while let nl = buf.firstIndex(of: 10) {
-        let e = Rex.event(buf[buf.startIndex..<nl])
-        layout = layout || e.layout
+        let e = Rex.event(buf[buf.startIndex..<nl], cli: &cli)
+        if let s = e.session { sessions.insert(s) }
         if let m = e.mark, host != nil { marks.append(m) }
         buf = Data(buf[(nl + 1)...])
       }
@@ -756,7 +776,7 @@ final class Tracker {
             DispatchQueue.main.async { App.shared.adopt(m, host: host) }
           }
         }
-        if layout { self?.refresh(host: host) }
+        sessions.forEach { self?.refresh($0) }
       }
     }
     let started = Date()
@@ -780,14 +800,11 @@ final class Tracker {
     Set(App.shared.panels.values.map(\.session)).forEach(refresh)
   }
 
-  func refresh(host: String?) {
-    Set(App.shared.panels.values.filter { $0.host == host }.map(\.session)).forEach(refresh)
-  }
-
   func refresh(_ session: String) {
+    let mine = App.shared.panels.values.filter { $0.session == session }
+    if mine.isEmpty { return }
     if refreshing.contains(session) { dirty.insert(session); return }
     refreshing.insert(session)
-    let mine = App.shared.panels.values.filter { $0.session == session }
     let ids = mine.map(\.id), host = mine.first?.host
     Rex.queue.async {
       let v = Rex.view(session, host: host)
