@@ -957,7 +957,9 @@ final class Tracker {
 
   func learnWindows() {
     let wins = Tracker.rexWindows().rex
-    let live = Set(wins.map(\.number))
+    // A hidden Rex window keeps its session, so a pane of another session isn't drawn on it when it comes back.
+    let all = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+    let live = Set(all.compactMap { $0[kCGWindowNumber as String] as? Int })
     windowSession = windowSession.filter { live.contains($0.key) }
     let rexActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.hasPrefix("com.superlogical.rex") == true
     guard rexActive, let front = wins.first,
