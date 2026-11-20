@@ -29,11 +29,12 @@ EOF
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+# The rex command: from PATH, else the Rex pane's REX_BIN_DIR.
+rexbin="$(command -v rex 2>/dev/null || true)"
+[ -n "$rexbin" ] || { [ -x "${REX_BIN_DIR:-}/rex" ] && rexbin="$REX_BIN_DIR/rex"; } || true
 rex() {
-  if command -v rex >/dev/null 2>&1; then command rex "$@"
-  elif [ -x "${REX_BIN_DIR:-}/rex" ]; then "$REX_BIN_DIR/rex" "$@"
-  else die "the rex command isn't on PATH and REX_BIN_DIR isn't set. Run this from a Rex pane."
-  fi
+  [ -n "$rexbin" ] || die "the rex command isn't on PATH and REX_BIN_DIR isn't set. Run this from a Rex pane."
+  "$rexbin" "$@"
 }
 
 # The placeholder: show URL as a terminal hyperlink, and take each line written
