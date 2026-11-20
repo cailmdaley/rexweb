@@ -781,7 +781,8 @@ final class Tracker {
     }
     let started = Date()
     p.terminationHandler = { [weak self] _ in
-      let delay = host != nil && Date().timeIntervalSince(started) < 10 ? 30.0 : 2.0
+      // A host's stream that ends within a minute, as a connection that times out does, retries after 30 s.
+      let delay = host != nil && Date().timeIntervalSince(started) < 60 ? 30.0 : 2.0
       DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
         guard let self, host.map(self.hosts.contains) ?? true else { return }
         self.startEvents(host)
