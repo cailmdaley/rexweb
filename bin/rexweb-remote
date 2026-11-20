@@ -1,10 +1,11 @@
 #!/bin/sh
 # rexweb-remote: open a RexWeb browser pane from a Rex pane on another host.
 #
-# It splits a placeholder pane beside this one. The placeholder shows the
-# page's address as a link and sets its terminal title to "rexweb URL"; RexWeb
-# on the Mac that connects to this host finds the pane by that title and draws
-# the page over it. Needs only sh and the rex command.
+# It splits a placeholder pane labelled "rexweb" beside this one. The
+# placeholder shows the page's address as a link and sets its terminal title to
+# "rexweb URL"; RexWeb on the Mac that connects to this host finds the pane by
+# that label and title and draws the page over it. Needs only sh and the rex
+# command.
 set -eu
 
 usage() {
@@ -21,7 +22,8 @@ Options for open:
   -b, --block BLOCK      split beside BLOCK (defaults to REX_BLOCK)
       --focus=BOOL       focus the new pane (default false)
 
-URL must be an address the Mac can reach: localhost there is the Mac itself.
+URL must be an http or https address the Mac can reach: localhost there is
+the Mac itself.
 EOF
 }
 
@@ -70,9 +72,10 @@ case "$cmd" in
     done
     case "$split" in right|left|above|below) ;; *) die "invalid --split \"$split\": use right, left, above, or below" ;; esac
     case "$focus" in true|false) ;; *) die "invalid --focus \"$focus\": use true or false" ;; esac
+    case "$url" in ""|http://*|https://*) ;; *) die "URL must start with http:// or https://" ;; esac
     [ -n "$anchor" ] || die "no pane to split beside: run this in a Rex pane, or pass -b BLOCK"
     self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
-    set -- split -b "$anchor" --split="$split" --focus="$focus" --shell=none --label browser
+    set -- split -b "$anchor" --split="$split" --focus="$focus" --shell=none --label rexweb
     [ -n "${REX_SESSION:-}" ] && set -- "$@" -s "$REX_SESSION"
     [ -n "$ratio" ] && set -- "$@" --ratio "$ratio"
     rex "$@" -- "$self" hold "$url"

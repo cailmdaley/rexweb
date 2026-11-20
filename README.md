@@ -156,16 +156,19 @@ rexweb-remote close "$id"
 ```
 
 `open` takes `--split`, `--ratio`, `-b BLOCK`, and `--focus=true`; it leaves
-focus where it is by default. The URL must be one your Mac can reach, since the
-page loads there: `localhost` means the Mac.
+focus where it is by default. The URL must be an `http` or `https` address
+that your Mac can reach, since the page loads there: `localhost` means the Mac.
 
-The new pane runs on the remote host and shows the page's address as a link,
-which is what Rex shows on a phone. RexWeb on the Mac follows every host in
-your Rex host list, finds such panes by their terminal title, `rexweb URL`, and
-draws the page over them. From the Mac, `rexweb ls` lists them with the
-others, and every `rexweb` command works on them. When you browse to another
-page, RexWeb writes its address back to the pane, so the link stays current
-and a restarted RexWeb reopens the page you were on.
+The new pane runs on the remote host, carries the block label `rexweb`, and
+shows the page's address as a link, which is what Rex shows on a phone.
+RexWeb on the Mac follows every host in your Rex host list, finds panes whose
+label starts with `rexweb` and whose terminal title is `rexweb URL`, and draws
+the page over them. It takes only `http` and `https` addresses from a title.
+The label is the part a program can't fake by printing a title, so a browser
+pane's header reads `rexweb` and then the page title. From the Mac, `rexweb
+ls` lists them with the others, and every `rexweb` command works on them. When
+you browse to another page, RexWeb writes its address back to the pane, so the
+link stays current and a restarted RexWeb reopens the page you were on.
 
 ## Signing in
 

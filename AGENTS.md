@@ -70,8 +70,8 @@ id=$(rexweb-remote open --split=below http://myhost.example.ts.net:8000)
 rexweb-remote close "$id"
 ```
 
-The page loads on the person's Mac, so give a URL the Mac can reach, not
-`localhost`. `open` prints the block ID and returns at once; it doesn't wait
+The page loads on the person's Mac, so give an `http` or `https` URL the Mac
+can reach, not `localhost`. `open` prints the block ID and returns at once; it doesn't wait
 for the page or report load errors. Driving the page (`snapshot`, `click`,
 `eval`, ...) works only from the Mac, with `rexweb -b ID`.
 

@@ -184,17 +184,31 @@ enum Rex {
     return (o["hosts"] as? [[String: Any]] ?? []).compactMap { ($0["endpoints"] as? [String])?.first }
   }
 
-  /// A pane that `rexweb-remote hold` keeps sets its terminal title to "rexweb URL".
+  /// A pane that `rexweb-remote hold` keeps sets its terminal title to "rexweb URL". Any program can set a title, so
+  /// a pane counts only if its block label, which only rex calls can set, also starts with "rexweb".
   struct Mark { let session, block, url: String }
 
-  static func mark(title: String) -> String? { title.hasPrefix("rexweb ") ? String(title.dropFirst(7)) : nil }
+  /// The URL in a marked title: an http or https address, or empty for a blank page.
+  static func mark(title: String) -> String? {
+    guard title.hasPrefix("rexweb ") else { return nil }
+    let url = String(title.dropFirst(7))
+    guard url.isEmpty || ["http", "https"].contains(URL(string: url)?.scheme?.lowercased()) else { return nil }
+    return url
+  }
+
+  static func labelled(_ m: Mark, host: String?) -> Bool {
+    guard let data = run(["api", "call", "session.list_blocks", json(["session_id": m.session])], host: host),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+    let b = (o["blocks"] as? [[String: Any]] ?? []).first { $0["block_id"] as? String == m.block }
+    return (b?["label"] as? String)?.hasPrefix("rexweb") == true
+  }
 
   static let scanScript = """
   local out = {}
   for _, s in ipairs(rex.call("session.list").sessions or {}) do
     rex.session.attach{ session_id = s.session_id }
     for _, b in ipairs((rex.call("session.list_blocks", { session_id = s.session_id }) or {}).blocks or {}) do
-      if b.creator_name == "com.superlogical.terminal" then
+      if b.creator_name == "com.superlogical.terminal" and (b.label or ""):sub(1, 6) == "rexweb" then
         local t = (rex.call("block.method", { session_id = s.session_id, block_id = b.block_id, method = "title" }) or {}).title or ""
         if t:sub(1, 7) == "rexweb " then out[#out + 1] = { session = s.session_id, block = b.block_id, title = t } end
       end
@@ -203,7 +217,7 @@ enum Rex {
   return out
   """
 
-  /// Every marked pane on `host`, found in one rex process.
+  /// Every marked, labelled pane on `host`, found in one rex process.
   static func scan(host: String?) -> [Mark] {
     guard let data = run(["do", "-e", scanScript, "--json"], host: host),
           let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
@@ -401,7 +415,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     let label = String(title.prefix(80))
     if label != lastLabel {
       lastLabel = label
-      Rex.setLabel(block: id, session: session, host: host, label)
+      Rex.setLabel(block: id, session: session, host: host, host == nil ? label : "rexweb " + label)
     }
   }
 
@@ -715,8 +729,9 @@ final class Tracker {
     }
   }
 
-  /// Stream a server's events: each one refreshes that server's panels, and a marked pane's title becomes a panel.
-  /// Each time the stream starts, a scan adopts the marked panes that already exist.
+  /// Stream a server's events: each one refreshes that server's panels, and on another host a marked, labelled pane
+  /// becomes a panel. Each time a host's stream starts, a scan adopts the marked panes that already exist there.
+  /// Local panes register themselves through `rexweb-pane`.
   func startEvents(_ host: String?) {
     let p = Rex.process(["events", "--all", "--json"], host: host)
     let out = Pipe()
@@ -731,11 +746,16 @@ final class Tracker {
       while let nl = buf.firstIndex(of: 10) {
         let e = Rex.event(buf[buf.startIndex..<nl])
         layout = layout || e.layout
-        if let m = e.mark { marks.append(m) }
+        if let m = e.mark, host != nil { marks.append(m) }
         buf = Data(buf[(nl + 1)...])
       }
       DispatchQueue.main.async {
-        marks.forEach { App.shared.adopt($0, host: host) }
+        for m in marks where App.shared.panels[m.block] == nil {
+          Rex.queue.async {
+            guard Rex.labelled(m, host: host) else { return }
+            DispatchQueue.main.async { App.shared.adopt(m, host: host) }
+          }
+        }
         if layout { self?.refresh(host: host) }
       }
     }
@@ -749,6 +769,7 @@ final class Tracker {
     }
     do { try p.run() } catch { log("events failed: \(error)"); return }
     streams[host ?? ""] = p
+    guard host != nil else { return }
     Rex.queue.async {
       let marks = Rex.scan(host: host)
       DispatchQueue.main.async { marks.forEach { App.shared.adopt($0, host: host) } }
@@ -1306,8 +1327,10 @@ final class App: NSObject, NSApplicationDelegate {
   /// Open a browser pane beside `p`. A pane on another host runs `rexweb-remote hold` there, from that host's PATH.
   func openPane(beside p: Panel, url: String) {
     let pane = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/rexweb-pane").path
-    let command = p.host == nil ? ["--shell=none", "--", "env", "REXWEB_FOCUS=true", pane, url] : ["--", "rexweb-remote", "hold", url]
-    Rex.async(["split", "-s", p.session, "-b", p.id, "--split=right", "--label", "browser"] + command, host: p.host)
+    let command = p.host == nil
+      ? ["--label", "browser", "--shell=none", "--", "env", "REXWEB_FOCUS=true", pane, url]
+      : ["--label", "rexweb", "--", "rexweb-remote", "hold", url]
+    Rex.async(["split", "-s", p.session, "-b", p.id, "--split=right"] + command, host: p.host)
   }
 
   func add(id: String, session: String, host: String?, url: String) -> Panel {
