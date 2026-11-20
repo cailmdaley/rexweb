@@ -79,7 +79,8 @@ case "$cmd" in
     set -- split -b "$anchor" --split="$split" --focus="$focus" --shell=none --label rexweb
     [ -n "${REX_SESSION:-}" ] && set -- "$@" -s "$REX_SESSION"
     [ -n "$ratio" ] && set -- "$@" --ratio "$ratio"
-    rex "$@" -- "$self" hold "$url"
+    # A busy login node can take longer than rex's 10 s default to start a pane.
+    rex --timeout 60s "$@" -- "$self" hold "$url"
     ;;
   close)
     [ $# -ge 1 ] || die "close needs a BLOCK"
