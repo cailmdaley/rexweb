@@ -637,7 +637,7 @@ final class Tracker {
     p.standardError = FileHandle.nullDevice
     out.fileHandleForReading.readabilityHandler = { [weak self] h in
       let d = h.availableData
-      if d.isEmpty { return }
+      if d.isEmpty { h.readabilityHandler = nil; return }
       DispatchQueue.main.async { self?.refreshAll() }
     }
     p.terminationHandler = { [weak self] _ in
