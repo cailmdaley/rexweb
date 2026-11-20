@@ -214,14 +214,18 @@ enum Rex {
     }
   }
 
-  /// The mark in one line of `rex events --json`, if the line is a marked pane's title change.
-  static func mark(event line: Data) -> Mark? {
-    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-          let p = o["payload"] as? [String: Any], let s = p["session_id"] as? String,
-          let e = (p["event"] as? [String: Any])?["payload"] as? [String: Any],
+  /// Read one line of `rex events --json`: whether it can change a layout, and the mark if it is a marked pane's
+  /// title change. Clients joining and leaving can't change a layout, and every rex call RexWeb makes is one.
+  static func event(_ line: Data) -> (layout: Bool, mark: Mark?) {
+    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return (false, nil) }
+    let p = o["payload"] as? [String: Any], event = p?["event"] as? [String: Any]
+    let type = event?["type"] as? String ?? o["type"] as? String ?? ""
+    guard let s = p?["session_id"] as? String, let e = event?["payload"] as? [String: Any],
           e["name"] as? String == "title_changed", let b = e["block_id"] as? String,
-          let url = mark(title: (e["payload"] as? [String: Any])?["title"] as? String ?? "") else { return nil }
-    return Mark(session: s, block: b, url: url)
+          let url = mark(title: (e["payload"] as? [String: Any])?["title"] as? String ?? "") else {
+      return (!type.hasPrefix("client_"), nil)
+    }
+    return (true, Mark(session: s, block: b, url: url))
   }
 
   static var version: String?
@@ -723,14 +727,16 @@ final class Tracker {
       let d = h.availableData
       if d.isEmpty { h.readabilityHandler = nil; return }
       buf.append(d)
-      var marks: [Rex.Mark] = []
+      var marks: [Rex.Mark] = [], layout = false
       while let nl = buf.firstIndex(of: 10) {
-        if let m = Rex.mark(event: buf[buf.startIndex..<nl]) { marks.append(m) }
+        let e = Rex.event(buf[buf.startIndex..<nl])
+        layout = layout || e.layout
+        if let m = e.mark { marks.append(m) }
         buf = Data(buf[(nl + 1)...])
       }
       DispatchQueue.main.async {
         marks.forEach { App.shared.adopt($0, host: host) }
-        self?.refresh(host: host)
+        if layout { self?.refresh(host: host) }
       }
     }
     let started = Date()
