@@ -764,7 +764,7 @@ final class Tracker {
       let frac = place.rect
       guard let rw = window(for: p, place, v, rexWins, primaryHeight) else { hide(p); continue }
 
-      let key = "\(frac) \(place.floating) \(ins) \(rw.number)"
+      let key = "\(frac) \(place.floating) \(rw.number)"
       if key != p.layoutKey {
         p.layoutKey = key
         p.settleUntil = Date().addingTimeInterval(0.4)
