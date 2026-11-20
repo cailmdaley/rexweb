@@ -2,9 +2,19 @@
 # rexweb: native WebKit browser panes for Rex.
 set -eo pipefail
 
-cfg="$HOME/.rexweb/config.json"
+rwdir="${REXWEB_DIR:-$HOME/.rexweb}"
+cfg="$rwdir/config.json"
 port="${REXWEB_PORT:-$(jq -r '.port // 18802' "$cfg" 2>/dev/null || echo 18802)}"
 self="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+
+# The rex command: from PATH, else the Rex pane's REX_BIN_DIR, else rex_bin in the config.
+rexbin="$(command -v rex 2>/dev/null || true)"
+[ -n "$rexbin" ] || { [ -x "${REX_BIN_DIR:-}/rex" ] && rexbin="$REX_BIN_DIR/rex"; } || true
+[ -n "$rexbin" ] || rexbin="$(jq -r '.rex_bin // empty' "$cfg" 2>/dev/null || true)"
+rex() {
+  [ -n "$rexbin" ] || die "can't find the rex command. Install Rex, run this from a Rex pane, or set rex_bin in $cfg."
+  "$rexbin" "$@"
+}
 
 # ---------------------------------------------------------------- help text
 
@@ -324,7 +334,7 @@ EOF
 
 die() { echo "Error: $*" >&2; exit 1; }
 
-token() { cat "$HOME/.rexweb/token" 2>/dev/null || true; }
+token() { cat "$rwdir/token" 2>/dev/null || true; }
 
 raw() {
   curl -s -m "${3:-1}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' \
@@ -415,7 +425,7 @@ case "$cmd" in
     }
     if command -v rexweb >/dev/null 2>&1; then check 1 path "rexweb is $(command -v rexweb)"
     else check 0 path "rexweb isn't on PATH. Add: export PATH=\"\$HOME/.local/bin:\$PATH\""; fi
-    if command -v rex >/dev/null 2>&1 && rv="$(rex version 2>/dev/null | head -1)"; then check 1 rex "$rv"
+    if rv="$(rex version 2>/dev/null | head -1)"; then check 1 rex "$rv ($rexbin)"
     else check 0 rex "the rex command doesn't work. Install Rex: https://www.superlogical.com/rex/docs/installation"; fi
     app="$(app_path)"
     if [ -n "$app" ]; then check 1 app "$app"; else check 0 app "RexWeb.app isn't installed. Run ./install.sh in the rexweb repo"; fi
@@ -463,7 +473,6 @@ case "$cmd" in
     case "$split" in right|left|above|below) ;; *) die "invalid --split \"$split\": use right, left, above, or below" ;; esac
     case "$focus" in true|false) ;; *) die "invalid --focus \"$focus\": use true or false" ;; esac
     if [ -n "$ratio" ]; then case "$ratio" in *[!0-9]*) die "invalid --ratio \"$ratio\": use a percent from 1 to 99" ;; esac; fi
-    command -v rex >/dev/null 2>&1 || die "the rex command isn't on PATH. Install Rex, or run this from a Rex pane."
     pb="$(pane_bin)"
     opts=(--shell=none --label browser --json --focus="$focus")
     [ -n "$session" ] && opts+=(-s "$session")
@@ -520,8 +529,8 @@ case "$cmd" in
 
   close)
     parse "$@"
-    id="$(api /info "$(target)" | jq -r .id)"
-    rex block close "$id" >/dev/null 2>&1 || api /close "$(jq -nc --arg id "$id" '{id:$id}')" >/dev/null
+    info="$(api /info "$(target)")"; id="$(jq -r .id <<<"$info")"; host="$(jq -r '.host // empty' <<<"$info")"
+    rex ${host:+-S "$host"} block close "$id" >/dev/null 2>&1 || api /close "$(jq -nc --arg id "$id" '{id:$id}')" >/dev/null
     [ "$json" = 1 ] && jq -nc --arg id "$id" '{closed:$id}' || echo "$id"
     ;;
 

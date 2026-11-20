@@ -5,7 +5,8 @@
 set -u
 PATH="$PATH:/usr/bin:/opt/homebrew/bin:/usr/local/bin"
 url="${1:-}"
-cfg="$HOME/.rexweb/config.json"
+rwdir="${REXWEB_DIR:-$HOME/.rexweb}"
+cfg="$rwdir/config.json"
 port="${REXWEB_PORT:-$(jq -r '.port // 18802' "$cfg" 2>/dev/null || echo 18802)}"
 id="${REX_BLOCK:?rexweb-pane must run inside a Rex pane}"
 session="${REX_SESSION:?rexweb-pane must run inside a Rex pane}"
@@ -16,7 +17,7 @@ command -v jq >/dev/null 2>&1 || { printf '  rexweb needs jq. Install it with: b
 
 post() {
   curl -s -m "${3:-3}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' \
-    -H "x-rexweb-token: $(cat "$HOME/.rexweb/token" 2>/dev/null)" -d "$2"
+    -H "x-rexweb-token: $(cat "$rwdir/token" 2>/dev/null)" -d "$2"
 }
 
 shown=""

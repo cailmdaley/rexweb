@@ -59,6 +59,22 @@ rexweb close -b "$id"
   so poll it rather than reading it once.
 - Errors go to stderr as `Error: ...`, with exit status 1.
 
+## On a remote host
+
+If your Rex pane runs on another host (Linux included), the `rexweb` command
+and RexWeb aren't there. Use `rexweb-remote`, a copy of `bin/rexweb-remote`
+from this repo, which needs only `sh` and Rex:
+
+```sh
+id=$(rexweb-remote open --split=below http://myhost.example.ts.net:8000)
+rexweb-remote close "$id"
+```
+
+The page loads on the person's Mac, so give a URL the Mac can reach, not
+`localhost`. `open` prints the block ID and returns at once; it doesn't wait
+for the page or report load errors. Driving the page (`snapshot`, `click`,
+`eval`, ...) works only from the Mac, with `rexweb -b ID`.
+
 ## Needs a person
 
 These commands open a macOS dialog. Don't run them unattended:

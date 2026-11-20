@@ -16,7 +16,8 @@ struct Config {
   var rexBin = ""
   var configError: String?
 
-  static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".rexweb")
+  static let dir = ProcessInfo.processInfo.environment["REXWEB_DIR"].map { URL(fileURLWithPath: $0) }
+    ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".rexweb")
 
   static func findRex() -> String {
     let fm = FileManager.default
@@ -141,16 +142,23 @@ func log(_ s: String) {
 enum Rex {
   static let queue = DispatchQueue(label: "rexweb.rex", attributes: .concurrent)
 
-  @discardableResult
-  static func run(_ args: [String]) -> Data? {
+  /// A rex process for `args`, sent to `host` (a server address) or, when nil, to the local server.
+  static func process(_ args: [String], host: String? = nil) -> Process {
     let p = Process()
+    let full = (host.map { ["-S", $0] } ?? []) + args
     if config.rexBin.contains("/") {
       p.executableURL = URL(fileURLWithPath: config.rexBin)
-      p.arguments = args
+      p.arguments = full
     } else {
       p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-      p.arguments = [config.rexBin] + args
+      p.arguments = [config.rexBin] + full
     }
+    return p
+  }
+
+  @discardableResult
+  static func run(_ args: [String], host: String? = nil) -> Data? {
+    let p = process(args, host: host)
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
@@ -160,13 +168,61 @@ enum Rex {
     return p.terminationStatus == 0 ? data : nil
   }
 
-  static func view(_ session: String) -> [String: Any]? {
-    let args = String(data: try! JSONSerialization.data(withJSONObject: ["session_id": session]), encoding: .utf8)!
-    guard let data = run(["api", "call", "session.view", args]) else { return nil }
+  static func json(_ o: Any) -> String { String(decoding: try! JSONSerialization.data(withJSONObject: o), as: UTF8.self) }
+
+  static func view(_ session: String, host: String?) -> [String: Any]? {
+    guard let data = run(["api", "call", "session.view", json(["session_id": session])], host: host) else { return nil }
     return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
   }
 
-  static func async(_ args: [String]) { queue.async { run(args) } }
+  static func async(_ args: [String], host: String? = nil) { queue.async { run(args, host: host) } }
+
+  /// The server's hosts, as the address of each one's first endpoint.
+  static func hosts() -> [String]? {
+    guard let data = run(["api", "call", "hosts.list", "{}"]),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return (o["hosts"] as? [[String: Any]] ?? []).compactMap { ($0["endpoints"] as? [String])?.first }
+  }
+
+  /// A pane that `rexweb-remote hold` keeps sets its terminal title to "rexweb URL".
+  struct Mark { let session, block, url: String }
+
+  static func mark(title: String) -> String? { title.hasPrefix("rexweb ") ? String(title.dropFirst(7)) : nil }
+
+  static let scanScript = """
+  local out = {}
+  for _, s in ipairs(rex.call("session.list").sessions or {}) do
+    rex.session.attach{ session_id = s.session_id }
+    for _, b in ipairs((rex.call("session.list_blocks", { session_id = s.session_id }) or {}).blocks or {}) do
+      if b.creator_name == "com.superlogical.terminal" then
+        local t = (rex.call("block.method", { session_id = s.session_id, block_id = b.block_id, method = "title" }) or {}).title or ""
+        if t:sub(1, 7) == "rexweb " then out[#out + 1] = { session = s.session_id, block = b.block_id, title = t } end
+      end
+    end
+  end
+  return out
+  """
+
+  /// Every marked pane on `host`, found in one rex process.
+  static func scan(host: String?) -> [Mark] {
+    guard let data = run(["do", "-e", scanScript, "--json"], host: host),
+          let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+    return list.compactMap { m in
+      guard let s = m["session"] as? String, let b = m["block"] as? String,
+            let url = mark(title: m["title"] as? String ?? "") else { return nil }
+      return Mark(session: s, block: b, url: url)
+    }
+  }
+
+  /// The mark in one line of `rex events --json`, if the line is a marked pane's title change.
+  static func mark(event line: Data) -> Mark? {
+    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+          let p = o["payload"] as? [String: Any], let s = p["session_id"] as? String,
+          let e = (p["event"] as? [String: Any])?["payload"] as? [String: Any],
+          e["name"] as? String == "title_changed", let b = e["block_id"] as? String,
+          let url = mark(title: (e["payload"] as? [String: Any])?["title"] as? String ?? "") else { return nil }
+    return Mark(session: s, block: b, url: url)
+  }
 
   static var version: String?
   static func checkVersion() {
@@ -179,8 +235,8 @@ enum Rex {
 
   struct Grid { let columns, rows, cellWidth, cellHeight: Double }
 
-  static func size(block: String, session: String) -> (displayed: Bool, grid: Grid?)? {
-    guard let data = run(["block", "call", "-s", session, "-b", block, "size"]),
+  static func size(block: String, session: String, host: String?) -> (displayed: Bool, grid: Grid?)? {
+    guard let data = run(["block", "call", "-s", session, "-b", block, "size"], host: host),
           let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
     let shown = !((o["desired"] as? [Any]) ?? []).isEmpty
     func n(_ k: String) -> Double? { (o[k] as? NSNumber)?.doubleValue }
@@ -189,15 +245,15 @@ enum Rex {
   }
 
   static let labelQueue = DispatchQueue(label: "rexweb.label")
-  static var pendingLabels: [String: (String, String)] = [:]
+  static var pendingLabels: [String: (String, String?, String)] = [:]
   static let labelLock = NSLock()
 
-  static func setLabel(block: String, session: String, _ label: String) {
-    labelLock.lock(); pendingLabels[block] = (session, label); labelLock.unlock()
+  static func setLabel(block: String, session: String, host: String?, _ label: String) {
+    labelLock.lock(); pendingLabels[block] = (session, host, label); labelLock.unlock()
     labelQueue.async {
       labelLock.lock(); let next = pendingLabels.removeValue(forKey: block); labelLock.unlock()
-      guard let (session, label) = next else { return }
-      run(["block", "rename", "-s", session, block, label])
+      guard let (session, host, label) = next else { return }
+      run(["block", "rename", "-s", session, block, label], host: host)
     }
   }
 }
@@ -210,6 +266,10 @@ final class OverlayWindow: NSWindow {
 final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate {
   let id: String
   let session: String
+  /// The address of the Rex server that holds the pane, or nil for the local server.
+  let host: String?
+  /// For a pane that `rexweb-remote hold` keeps, the last URL written to it; nil for a pane that registered itself.
+  var reported: String?
   let window: OverlayWindow
   let web: WKWebView
   let bar = NSView()
@@ -233,9 +293,10 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   static let barHeight: CGFloat = 30
   static let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: "6F1C0D2A-9C3B-4E55-9B7A-5E3B0AEB0001")!)
 
-  init(id: String, session: String) {
+  init(id: String, session: String, host: String?) {
     self.id = id
     self.session = session
+    self.host = host
     let conf = WKWebViewConfiguration()
     conf.websiteDataStore = Panel.store
     conf.applicationNameForUserAgent = "Version/26.4 Safari/605.1.15"
@@ -297,7 +358,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
       guard let self else { return }
       self.lastActive = Date()
-      Rex.async(["focus", "-s", self.session, self.id])
+      Rex.async(["focus", "-s", self.session, self.id], host: self.host)
     }
     web.addObserver(self, forKeyPath: "title", options: .new, context: nil)
     web.addObserver(self, forKeyPath: "URL", options: .new, context: nil)
@@ -328,16 +389,20 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     if window.firstResponder != urlField.currentEditor() {
       urlField.stringValue = web.url?.absoluteString ?? ""
     }
+    if let r = reported, let u = web.url?.absoluteString, u != r {
+      reported = u
+      Rex.async(["block", "call", "-s", session, "-b", id, "write", Rex.json(["data": u + "\n"])], host: host)
+    }
     guard let title = (web.title?.isEmpty == false ? web.title : web.url?.host), !title.isEmpty else { return }
     let label = String(title.prefix(80))
     if label != lastLabel {
       lastLabel = label
-      Rex.setLabel(block: id, session: session, label)
+      Rex.setLabel(block: id, session: session, host: host, label)
     }
   }
 
   func info() -> [String: Any] {
-    ["id": id, "session": session, "url": web.url?.absoluteString ?? "", "title": web.title ?? "",
+    ["id": id, "session": session, "host": orNull(host), "url": web.url?.absoluteString ?? "", "title": web.title ?? "",
      "loading": web.isLoading, "visible": visible, "error": orNull(lastError)]
   }
 
@@ -425,7 +490,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
                decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
     if navigationAction.modifierFlags.contains(.command), let url = navigationAction.request.url,
        navigationAction.navigationType == .linkActivated {
-      App.shared.openPane(beside: id, session: session, url: url.absoluteString)
+      App.shared.openPane(beside: self, url: url.absoluteString)
       decisionHandler(.cancel)
       return
     }
@@ -614,7 +679,9 @@ final class Tracker {
   var pendingPair: (Int, String)?
   var refreshing = Set<String>()
   var dirty = Set<String>()
-  var eventsProcess: Process?
+  /// One `rex events` stream per server: "" for the local server, else a host's address.
+  var streams: [String: Process] = [:]
+  var hosts = Set<String>()
   var rexWasActive = false
   var insets = RexChrome.read()
 
@@ -625,41 +692,82 @@ final class Tracker {
       self?.learnWindows()
     }
     Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshAll() }
-    startEvents()
+    Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.syncHosts() }
+    startEvents(nil)
+    syncHosts()
   }
 
-  func startEvents() {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: config.rexBin)
-    p.arguments = ["events", "--all", "--json"]
+  /// Follow every host in the local server's host list, and stop following hosts that left it.
+  func syncHosts() {
+    Rex.queue.async {
+      guard let list = Rex.hosts() else { return }
+      DispatchQueue.main.async {
+        let now = Set(list)
+        for h in self.hosts.subtracting(now) { self.streams.removeValue(forKey: h)?.terminate() }
+        let added = now.subtracting(self.hosts)
+        self.hosts = now
+        added.forEach { self.startEvents($0) }
+      }
+    }
+  }
+
+  /// Stream a server's events: each one refreshes that server's panels, and a marked pane's title becomes a panel.
+  /// Each time the stream starts, a scan adopts the marked panes that already exist.
+  func startEvents(_ host: String?) {
+    let p = Rex.process(["events", "--all", "--json"], host: host)
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
+    var buf = Data()
     out.fileHandleForReading.readabilityHandler = { [weak self] h in
       let d = h.availableData
       if d.isEmpty { h.readabilityHandler = nil; return }
-      DispatchQueue.main.async { self?.refreshAll() }
+      buf.append(d)
+      var marks: [Rex.Mark] = []
+      while let nl = buf.firstIndex(of: 10) {
+        if let m = Rex.mark(event: buf[buf.startIndex..<nl]) { marks.append(m) }
+        buf = Data(buf[(nl + 1)...])
+      }
+      DispatchQueue.main.async {
+        marks.forEach { App.shared.adopt($0, host: host) }
+        self?.refresh(host: host)
+      }
     }
+    let started = Date()
     p.terminationHandler = { [weak self] _ in
-      DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self?.startEvents() }
+      let delay = host != nil && Date().timeIntervalSince(started) < 10 ? 30.0 : 2.0
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+        guard let self, host.map(self.hosts.contains) ?? true else { return }
+        self.startEvents(host)
+      }
     }
-    do { try p.run(); eventsProcess = p } catch { log("events failed: \(error)") }
+    do { try p.run() } catch { log("events failed: \(error)"); return }
+    streams[host ?? ""] = p
+    Rex.queue.async {
+      let marks = Rex.scan(host: host)
+      DispatchQueue.main.async { marks.forEach { App.shared.adopt($0, host: host) } }
+    }
   }
 
   func refreshAll() {
-    for s in Set(App.shared.panels.values.map(\.session)) { refresh(s) }
+    Set(App.shared.panels.values.map(\.session)).forEach(refresh)
+  }
+
+  func refresh(host: String?) {
+    Set(App.shared.panels.values.filter { $0.host == host }.map(\.session)).forEach(refresh)
   }
 
   func refresh(_ session: String) {
     if refreshing.contains(session) { dirty.insert(session); return }
     refreshing.insert(session)
-    let ids = App.shared.panels.values.filter { $0.session == session }.map(\.id)
+    let mine = App.shared.panels.values.filter { $0.session == session }
+    let ids = mine.map(\.id), host = mine.first?.host
     Rex.queue.async {
-      let v = Rex.view(session)
+      let v = Rex.view(session, host: host)
       var shown: [String: Bool] = [:]
       var grids: [String: Rex.Grid] = [:]
       for id in ids {
-        guard let sz = Rex.size(block: id, session: session) else { continue }
+        guard let sz = Rex.size(block: id, session: session, host: host) else { continue }
         shown[id] = sz.displayed
         if let g = sz.grid { grids[id] = g }
       }
@@ -1150,12 +1258,12 @@ final class App: NSObject, NSApplicationDelegate {
       case "=", "+": p.web.pageZoom = min(3, p.web.pageZoom + 0.1); return true
       case "-": p.web.pageZoom = max(0.3, p.web.pageZoom - 0.1); return true
       case "0": p.web.pageZoom = 1; return true
-      case "w": Rex.async(["block", "close", p.id]); return true
+      case "w": Rex.async(["block", "close", "-s", p.session, p.id], host: p.host); return true
       default: break
       }
     }
     if m == [.command, .shift], c == "r" { p.web.reloadFromOrigin(); return true }
-    if m == [.command, .shift], c == "b" { openPane(beside: p.id, session: p.session, url: ""); return true }
+    if m == [.command, .shift], c == "b" { openPane(beside: p, url: ""); return true }
     if m == [.control, .option] || m == [.control, .option, .function] || m == [.control, .option, .numericPad, .function] {
       let dir: String? = [123: "left", 124: "right", 125: "down", 126: "up"][Int(e.keyCode)]
       if let dir { returnToRex(p, focus: dir); return true }
@@ -1167,7 +1275,7 @@ final class App: NSObject, NSApplicationDelegate {
   func returnToRex(_ p: Panel, focus dir: String?) {
     p.focusedInRex = true
     activateRex()
-    if let dir { Rex.async(["focus", "-s", p.session, "-b", p.id, dir]) }
+    if let dir { Rex.async(["focus", "-s", p.session, "-b", p.id, dir], host: p.host) }
   }
 
   func activateRex() {
@@ -1189,10 +1297,26 @@ final class App: NSObject, NSApplicationDelegate {
     p.close()
   }
 
-  func openPane(beside id: String, session: String, url: String) {
+  /// Open a browser pane beside `p`. A pane on another host runs `rexweb-remote hold` there, from that host's PATH.
+  func openPane(beside p: Panel, url: String) {
     let pane = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/rexweb-pane").path
-    Rex.async(["split", "-s", session, "-b", id, "--split=right", "--shell=none", "--label", "browser",
-               "--", "env", "REXWEB_FOCUS=true", pane, url])
+    let command = p.host == nil ? ["--shell=none", "--", "env", "REXWEB_FOCUS=true", pane, url] : ["--", "rexweb-remote", "hold", url]
+    Rex.async(["split", "-s", p.session, "-b", p.id, "--split=right", "--label", "browser"] + command, host: p.host)
+  }
+
+  func add(id: String, session: String, host: String?, url: String) -> Panel {
+    let p = Panel(id: id, session: session, host: host)
+    panels[id] = p
+    tracker.refresh(session)
+    if !url.isEmpty { p.load(url) }
+    log("pane \(id.suffix(6)) registered\(host.map { " on \($0)" } ?? "")")
+    return p
+  }
+
+  /// Make a panel for a pane that `rexweb-remote hold` keeps, unless it has one.
+  func adopt(_ m: Rex.Mark, host: String?) {
+    guard panels[m.block] == nil else { return }
+    add(id: m.block, session: m.session, host: host, url: m.url).reported = m.url
   }
 
   func resolve(_ raw: Any?) -> Panel? {
@@ -1233,12 +1357,8 @@ final class App: NSObject, NSApplicationDelegate {
     case "/register":
       guard let id = input["id"] as? String, let session = input["session"] as? String else { return fail("id and session required") }
       if let p = panels[id] { return ok(p.info()) }
-      let p = Panel(id: id, session: session)
-      panels[id] = p
-      tracker.refresh(session)
-      if let url = input["url"] as? String, !url.isEmpty { p.load(url) }
-      log("pane \(id.suffix(6)) registered")
       let url = input["url"] as? String ?? ""
+      let p = add(id: id, session: session, host: nil, url: url)
       if input["focus"] as? Bool == true {
         p.focusURLWhenShown = url.isEmpty
         self.focus(p)

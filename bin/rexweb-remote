@@ -1,0 +1,88 @@
+#!/bin/sh
+# rexweb-remote: open a RexWeb browser pane from a Rex pane on another host.
+#
+# It splits a placeholder pane beside this one. The placeholder shows the
+# page's address as a link and sets its terminal title to "rexweb URL"; RexWeb
+# on the Mac that connects to this host finds the pane by that title and draws
+# the page over it. Needs only sh and the rex command.
+set -eu
+
+usage() {
+  cat <<'EOF'
+Open a browser pane on the Mac that shows this host's Rex sessions.
+
+Usage:
+  rexweb-remote open [flags] URL   split a browser pane beside this pane and print its block ID
+  rexweb-remote close BLOCK        close a browser pane
+
+Options for open:
+      --split DIRECTION  right, left, above, or below (default right)
+      --ratio PCT        give the new pane PCT percent of the split (default 50)
+  -b, --block BLOCK      split beside BLOCK (defaults to REX_BLOCK)
+      --focus=BOOL       focus the new pane (default false)
+
+URL must be an address the Mac can reach: localhost there is the Mac itself.
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+rex() {
+  if command -v rex >/dev/null 2>&1; then command rex "$@"
+  elif [ -x "${REX_BIN_DIR:-}/rex" ]; then "$REX_BIN_DIR/rex" "$@"
+  else die "the rex command isn't on PATH and REX_BIN_DIR isn't set. Run this from a Rex pane."
+  fi
+}
+
+# The placeholder: show URL as a terminal hyperlink, and take each line written
+# to the pane (RexWeb writes the page's address when it changes) as the new URL.
+hold() {
+  url="${1:-}"
+  stty -echo 2>/dev/null || true
+  while :; do
+    printf '\033]2;rexweb %s\007\033[?25l\033[2J\033[H  \033]8;;%s\033\\%s\033]8;;\033\\\n' "$url" "$url" "$url"
+    if IFS= read -r line; then
+      [ -n "$line" ] && url="$line"
+    else
+      while :; do sleep 3600; done
+    fi
+  done
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  open)
+    url="" split=right ratio="" anchor="${REX_BLOCK:-}" focus=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --split) [ $# -ge 2 ] || die "flag needs an argument: $1"; split="$2"; shift 2 ;;
+        --split=*) split="${1#*=}"; shift ;;
+        --ratio) [ $# -ge 2 ] || die "flag needs an argument: $1"; ratio="$2"; shift 2 ;;
+        --ratio=*) ratio="${1#*=}"; shift ;;
+        -b|--block) [ $# -ge 2 ] || die "flag needs an argument: $1"; anchor="$2"; shift 2 ;;
+        --focus) focus=true; shift ;;
+        --focus=*) focus="${1#*=}"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*) die "unknown flag: $1" ;;
+        *) url="$1"; shift ;;
+      esac
+    done
+    case "$split" in right|left|above|below) ;; *) die "invalid --split \"$split\": use right, left, above, or below" ;; esac
+    case "$focus" in true|false) ;; *) die "invalid --focus \"$focus\": use true or false" ;; esac
+    [ -n "$anchor" ] || die "no pane to split beside: run this in a Rex pane, or pass -b BLOCK"
+    self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+    set -- split -b "$anchor" --split="$split" --focus="$focus" --shell=none --label browser
+    [ -n "${REX_SESSION:-}" ] && set -- "$@" -s "$REX_SESSION"
+    [ -n "$ratio" ] && set -- "$@" --ratio "$ratio"
+    rex "$@" -- "$self" hold "$url"
+    ;;
+  close)
+    [ $# -ge 1 ] || die "close needs a BLOCK"
+    rex block close ${REX_SESSION:+-s "$REX_SESSION"} "$1" >/dev/null
+    echo "$1"
+    ;;
+  hold) hold "${1:-}" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command \"$cmd\". Run \"rexweb-remote --help\"." ;;
+esac

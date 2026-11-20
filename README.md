@@ -143,6 +143,30 @@ after about a second. `snapshot`, `eval`, and `screenshot` work either way.
 [AGENTS.md](AGENTS.md) is the guide for coding agents. `rexweb skill` prints
 the same guide.
 
+## Remote hosts
+
+A Rex pane on another host, a server that the Rex app on your Mac connects to,
+can open a browser pane too. Copy `bin/rexweb-remote` onto that host, somewhere
+on its PATH such as `~/.local/bin`. It needs only `sh` and Rex. Then, in a
+pane on that host:
+
+```sh
+id=$(rexweb-remote open http://studio.example.ts.net:3000)
+rexweb-remote close "$id"
+```
+
+`open` takes `--split`, `--ratio`, `-b BLOCK`, and `--focus=true`; it leaves
+focus where it is by default. The URL must be one your Mac can reach, since the
+page loads there: `localhost` means the Mac.
+
+The new pane runs on the remote host and shows the page's address as a link,
+which is what Rex shows on a phone. RexWeb on the Mac follows every host in
+your Rex host list, finds such panes by their terminal title, `rexweb URL`, and
+draws the page over them. From the Mac, `rexweb ls` lists them with the
+others, and every `rexweb` command works on them. When you browse to another
+page, RexWeb writes its address back to the pane, so the link stays current
+and a restarted RexWeb reopens the page you were on.
+
 ## Signing in
 
 All browser panes share one profile. It survives restarts. You sign in to a
