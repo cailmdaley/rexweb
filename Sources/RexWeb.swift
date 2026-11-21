@@ -881,15 +881,49 @@ final class Tracker {
   /// Blocks whose label is being checked, so a terminal that keeps printing marked titles runs one check at a time.
   var checking = Set<String>()
   var hosts = Set<String>()
-  var rexWasActive = false
   var insets = RexChrome.read()
+  var insetsRead = Date.distantPast
+  /// Whether a Rex app is frontmost, kept current by workspace notifications.
+  var rexActive = Tracker.isRex(NSWorkspace.shared.frontmostApplication)
+  /// `tick` runs every frame until this time, and every `idleInterval` after it.
+  var hotUntil = Date.distantPast
+  var tickTimer: Timer?
+  /// What the last tick saw of the Rex windows, the stacking order of theirs and ours, and Rex's chrome.
+  var scene = ""
+  var learned = Date.distantPast
+
+  static let frameInterval = 1.0 / 60.0
+  static let idleInterval = 0.25
+
+  static func isRex(_ app: NSRunningApplication?) -> Bool { app?.bundleIdentifier?.hasPrefix("com.superlogical.rex") == true }
+
+  /// Run `tick` every frame for the next `seconds`, after anything that can move a Rex window or a pane on it.
+  func wake(_ seconds: TimeInterval = 1) {
+    hotUntil = max(hotUntil, Date().addingTimeInterval(seconds))
+    schedule(Tracker.frameInterval)
+  }
+
+  func schedule(_ interval: TimeInterval) {
+    if tickTimer?.timeInterval == interval { return }
+    tickTimer?.invalidate()
+    tickTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
+  }
 
   func start() {
-    Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
-    Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-      self?.insets = RexChrome.read()
-      self?.learnWindows()
+    schedule(Tracker.idleInterval)
+    // Window moves and resizes start with the mouse; other changes in what's on screen come with these
+    // notifications. The idle tick catches the rest, such as a window moved from the keyboard.
+    NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] _ in self?.wake() }
+    let ws = NSWorkspace.shared.notificationCenter
+    for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didHideApplicationNotification,
+                 NSWorkspace.didUnhideApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification] {
+      ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+        self?.rexActive = Tracker.isRex(NSWorkspace.shared.frontmostApplication)
+        self?.wake()
+      }
     }
+    NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil,
+                                           queue: .main) { [weak self] _ in self?.wake() }
     Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshAll() }
     Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.syncHosts() }
     startEvents(nil)
@@ -1012,9 +1046,11 @@ final class Tracker {
       let r = Rex.read(panes, host: host)
       DispatchQueue.main.async {
         self.refreshing.remove(key)
+        let (views, displayed) = (self.views as NSDictionary, self.displayed)
         self.displayed.merge(r.shown) { $1 }
         self.grids.merge(r.grids) { $1 }
         for (session, v) in r.views { self.views[session] = v; self.reconcile(session, panes[session] ?? []) }
+        if self.displayed != displayed || self.views as NSDictionary != views { self.wake() }
         if self.dirty.remove(key) != nil { self.refresh(host) }
       }
     }
@@ -1098,11 +1134,24 @@ final class Tracker {
     return w["focused_block_id"] as? String
   }
 
+  /// Place each panel over its pane. It runs every frame while something may be moving, and four times a second
+  /// otherwise, which is also when it notices a change no event announced and starts running every frame.
   func tick() {
+    let now = Date()
+    defer { schedule(now < hotUntil ? Tracker.frameInterval : Tracker.idleInterval) }
     let panels = App.shared.panels.values
-    if panels.isEmpty { return }
+    // With no panel to show or hide, the window list matters only for learning Rex's windows while Rex is in front.
+    let active = panels.contains { displayed[$0.id] == true || $0.visible }
+    if !active && !rexActive { return }
     let (rexWins, order) = Tracker.rexWindows()
-    let rexActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.hasPrefix("com.superlogical.rex") == true
+    if now.timeIntervalSince(learned) >= 0.2 { learned = now; learnWindows(rexWins) }
+    if !active { return }
+    if now.timeIntervalSince(insetsRead) >= 0.2 { insetsRead = now; insets = RexChrome.read() }
+    let ours = Set(panels.map { $0.window.windowNumber }), theirs = Set(rexWins.map(\.number))
+    let places: [String] = rexWins.map { w in "\(w.number) \(w.bounds)" }
+    let stack: [Int] = order.filter { n in ours.contains(n) || theirs.contains(n) }
+    let seen = "\(places) \(stack) \(insets)"
+    if seen != scene { scene = seen; hotUntil = max(hotUntil, now.addingTimeInterval(1)) }
     let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
 
     for p in panels {
@@ -1115,6 +1164,7 @@ final class Tracker {
       if key != p.layoutKey {
         p.layoutKey = key
         p.settleUntil = Date().addingTimeInterval(0.4)
+        hotUntil = max(hotUntil, p.settleUntil.addingTimeInterval(0.1))
         if p.window.isKeyWindow { p.pendingFocus = true }
       }
       if Date() < p.settleUntil { hide(p); continue }
@@ -1128,7 +1178,6 @@ final class Tracker {
 
       let mine = p.window.windowNumber
       let iMine = order.firstIndex(of: mine), iRex = order.firstIndex(of: rw.number)
-      let ours = Set(App.shared.panels.values.map { $0.window.windowNumber })
       var stacked = false
       if let iMine, let iRex, iMine < iRex {
         stacked = order[(iMine + 1)..<iRex].allSatisfy { ours.contains($0) }
@@ -1146,22 +1195,20 @@ final class Tracker {
       }
       p.focusedInRex = isFocused
     }
-    rexWasActive = rexActive
   }
 
-  func learnWindows() {
-    let wins = Tracker.rexWindows().rex
-    // A hidden Rex window keeps its session, so a pane of another session isn't drawn on it when it comes back.
-    let all = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
-    let live = Set(all.compactMap { $0[kCGWindowNumber as String] as? Int })
-    windowSession = windowSession.filter { live.contains($0.key) }
-    let rexActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.hasPrefix("com.superlogical.rex") == true
+  /// Pair the front Rex window with the session Rex last focused, once two readings 0.2 s apart agree.
+  func learnWindows(_ wins: [RexWindow]) {
     guard rexActive, let front = wins.first,
           let data = RexChrome.value("lastFocusedSession") as? Data,
           let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let session = o["sessionID"] as? String else { pendingPair = nil; return }
-    if let p = pendingPair, p.0 == front.number, p.1 == session {
-      windowSession = windowSession.filter { $0.value != session }
+    if let p = pendingPair, p.0 == front.number, p.1 == session, windowSession[front.number] != session {
+      // A hidden Rex window keeps its session, so a pane of another session isn't drawn on it when it comes back; a
+      // closed one gives it up.
+      let all = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+      let live = Set(all.compactMap { $0[kCGWindowNumber as String] as? Int })
+      windowSession = windowSession.filter { live.contains($0.key) && $0.value != session }
       windowSession[front.number] = session
     }
     pendingPair = (front.number, session)
@@ -1555,6 +1602,7 @@ final class App: NSObject, NSApplicationDelegate {
     p.retitles = retitles
     panels[id] = p
     tracker.refresh(host)
+    tracker.wake()
     if !url.isEmpty { p.load(url) }
     log("pane \(id.suffix(6)) registered\(host.map { " on \($0)" } ?? "")")
     return p
