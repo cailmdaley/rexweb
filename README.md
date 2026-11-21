@@ -165,8 +165,10 @@ shows the page's address as a link, which is what Rex shows on a phone.
 RexWeb on the Mac follows every host in your Rex host list, finds panes whose
 label starts with `rexweb` and whose terminal title is `rexweb URL`, and draws
 the page over them. It takes only `http` and `https` addresses from a title.
-The label is the part a program can't fake by printing a title, so a browser
-pane's header reads `rexweb` and then the page title. From the Mac, `rexweb
+The label is the part a program can't fake by printing a title. A pane
+labelled just `rexweb`, as `rexweb-remote` makes it, is relabelled `rexweb`
+and then the page title; a longer label, such as `rexweb shuttle`, is its
+creator's and stays as it is. From the Mac, `rexweb
 ls` lists them with the others, and every `rexweb` command works on them. When
 you browse to another page, RexWeb writes its address back to the pane, so the
 link stays current and a restarted RexWeb reopens the page you were on.

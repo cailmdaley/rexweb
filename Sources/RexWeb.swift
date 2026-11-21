@@ -193,7 +193,11 @@ enum Rex {
   /// A pane that holds a page by convention, such as one `rexweb-remote hold` keeps, sets its terminal title to
   /// "rexweb URL". Any program can set a title, so a pane counts only if its block label, which only rex calls can
   /// set, also starts with "rexweb".
-  struct Mark { let session, block, url: String }
+  struct Mark {
+    let session, block, url: String
+    /// The block's label, once read.
+    var label = ""
+  }
 
   /// The URL in a marked title: an http or https address, or empty for a blank page.
   static func mark(title: String) -> String? {
@@ -203,11 +207,12 @@ enum Rex {
     return url
   }
 
-  static func labelled(_ m: Mark, host: String?) -> Bool {
+  /// The marked pane's label, if it starts with "rexweb".
+  static func label(_ m: Mark, host: String?) -> String? {
     guard let data = run(["api", "call", "session.list_blocks", json(["session_id": m.session])], host: host),
-          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
     let b = (o["blocks"] as? [[String: Any]] ?? []).first { $0["block_id"] as? String == m.block }
-    return (b?["label"] as? String)?.hasPrefix("rexweb") == true
+    return (b?["label"] as? String).flatMap { $0.hasPrefix("rexweb") ? $0 : nil }
   }
 
   static let scanScript = """
@@ -217,7 +222,7 @@ enum Rex {
     for _, b in ipairs((rex.call("session.list_blocks", { session_id = s.session_id }) or {}).blocks or {}) do
       if b.creator_name == "com.superlogical.terminal" and (b.label or ""):sub(1, 6) == "rexweb" then
         local t = (rex.call("block.method", { session_id = s.session_id, block_id = b.block_id, method = "title" }) or {}).title or ""
-        if t:sub(1, 7) == "rexweb " then out[#out + 1] = { session = s.session_id, block = b.block_id, title = t } end
+        if t:sub(1, 7) == "rexweb " then out[#out + 1] = { session = s.session_id, block = b.block_id, title = t, label = b.label } end
       end
     end
   end
@@ -233,7 +238,7 @@ enum Rex {
     return list.compactMap { m in
       guard let s = m["session"] as? String, let b = m["block"] as? String,
             let url = mark(title: m["title"] as? String ?? "") else { return nil }
-      return Mark(session: s, block: b, url: url)
+      return Mark(session: s, block: b, url: url, label: m["label"] as? String ?? "")
     }
   }
 
@@ -394,6 +399,8 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   let host: String?
   /// For a pane adopted by its label and title, the last URL written to it; nil for a pane that registered itself.
   var reported: String?
+  /// Whether an adopted pane's label follows the page title: only when it was adopted labelled just "rexweb".
+  var retitles = false
   let window: OverlayWindow
   let web: WKWebView
   let bar = NSView()
@@ -524,8 +531,13 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     let label = String(title.prefix(80))
     if label != lastLabel {
       lastLabel = label
-      // An adopted pane keeps the "rexweb" label prefix that lets a scan adopt it again after RexWeb restarts.
-      Rex.setLabel(block: id, session: session, host: host, reported == nil ? label : "rexweb " + label)
+      // A registered pane takes the page title as its label. An adopted pane labelled just "rexweb" takes "rexweb"
+      // and the title, keeping the prefix that lets a scan adopt it again; any other adopted pane keeps its label.
+      if reported == nil {
+        Rex.setLabel(block: id, session: session, host: host, label)
+      } else if retitles {
+        Rex.setLabel(block: id, session: session, host: host, "rexweb " + label)
+      }
     }
   }
 
@@ -847,8 +859,8 @@ final class Tracker {
   }
 
   /// Stream a server's events, the local server's and each host's alike: a layout change refreshes the server's
-  /// panels and rescans it, a marked, labelled pane becomes a panel, and an adopted pane whose title loses
-  /// its mark loses its panel. Each time a stream starts, a scan adopts the marked panes already there and closes
+  /// panels, and rescans the local server, a marked, labelled pane becomes a panel, and an adopted pane whose title
+  /// loses its mark loses its panel. Each time a stream starts, a scan adopts the marked panes already there and closes
   /// the panels of panes that lost their mark meanwhile, as a Rex server restart leaves them.
   func startEvents(_ host: String?) {
     let p = Rex.process(["events", "--all", "--json"], host: host)
@@ -878,11 +890,13 @@ final class Tracker {
           self.unmarked[host ?? ""]?.remove(m.block)
           guard App.shared.panels[m.block] == nil else { continue }
           Rex.queue.async {
-            guard Rex.labelled(m, host: host) else { return }
+            guard let label = Rex.label(m, host: host) else { return }
+            var m = m
+            m.label = label
             DispatchQueue.main.async { if self.unmarked[host ?? ""]?.contains(m.block) != true { App.shared.adopt(m, host: host) } }
           }
         }
-        if !sessions.isEmpty { self.scan(host) }
+        if !sessions.isEmpty && host == nil { self.scan(host) }
         if App.shared.panels.values.contains(where: { $0.host == host && sessions.contains($0.session) }) { self.refresh(host) }
       }
     }
@@ -1476,9 +1490,10 @@ final class App: NSObject, NSApplicationDelegate {
   }
 
   @discardableResult
-  func add(id: String, session: String, host: String?, url: String, reported: String? = nil) -> Panel {
+  func add(id: String, session: String, host: String?, url: String, reported: String? = nil, retitles: Bool = false) -> Panel {
     let p = Panel(id: id, session: session, host: host)
     p.reported = reported
+    p.retitles = retitles
     panels[id] = p
     tracker.refresh(host)
     if !url.isEmpty { p.load(url) }
@@ -1489,7 +1504,7 @@ final class App: NSObject, NSApplicationDelegate {
   /// Make a panel for a marked, labelled pane, unless it has one.
   func adopt(_ m: Rex.Mark, host: String?) {
     guard panels[m.block] == nil else { return }
-    add(id: m.block, session: m.session, host: host, url: m.url, reported: m.url)
+    add(id: m.block, session: m.session, host: host, url: m.url, reported: m.url, retitles: m.label == "rexweb")
   }
 
   func resolve(_ raw: Any?) -> Panel? {
