@@ -223,6 +223,18 @@ enum Rex {
     return label
   }
 
+  /// Write `rex.args.url` as a line to a pane, only while its title is still marked: the server checks it just before
+  /// the write, so a pane that has become a shell, as a Rex server restart leaves it, never gets a URL typed into it.
+  static let writeBackScript = """
+  local s, b = rex.args.session, rex.args.block
+  rex.session.attach{ session_id = s }
+  local t = (rex.call("block.method", { session_id = s, block_id = b, method = "title" }) or {}).title or ""
+  local u = t:sub(8):lower()
+  if t:sub(1, 7) ~= "rexweb " or not (u == "" or u:sub(1, 7) == "http://" or u:sub(1, 8) == "https://") then return false end
+  rex.call("block.method", { session_id = s, block_id = b, method = "write", args = { data = rex.args.url .. "\\n" } })
+  return true
+  """
+
   static let scanScript = """
   local out = {}
   for _, s in ipairs(rex.call("session.list").sessions or {}) do
@@ -533,9 +545,12 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     if window.firstResponder != urlField.currentEditor() {
       urlField.stringValue = web.url?.absoluteString ?? ""
     }
-    if let r = reported, let u = web.url?.absoluteString, u != r {
-      reported = u
-      Rex.async(["block", "call", "-s", session, "-b", id, "write", Rex.json(["data": u + "\n"])], host: host)
+    // An adopted pane hears each http or https address the page goes to. Any other address isn't one a marked
+    // title can hold, so the pane keeps the last one it heard.
+    if let r = reported, let u = web.url, u.absoluteString != r, ["http", "https"].contains(u.scheme?.lowercased()) {
+      reported = u.absoluteString
+      Rex.async(["do", "-e", Rex.writeBackScript, "--args",
+                 Rex.json(["session": session, "block": id, "url": u.absoluteString])], host: host)
     }
     guard let title = (web.title?.isEmpty == false ? web.title : web.url?.host), !title.isEmpty else { return }
     let label = String(title.prefix(80))
