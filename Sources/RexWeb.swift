@@ -167,13 +167,18 @@ enum Rex {
     return p
   }
 
+  /// Run rex and return its output, or nil if it fails. A call given a `deadline` is stopped, and fails, once it has
+  /// run that many seconds, so a stalled server can't hold up the refreshes and scans that wait on it.
   @discardableResult
-  static func run(_ args: [String], host: String? = nil) -> Data? {
+  static func run(_ args: [String], host: String? = nil, deadline: TimeInterval? = nil) -> Data? {
     let p = process(args, host: host)
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
     do { try p.run() } catch { log("rex failed: \(error)"); return nil }
+    if let deadline {
+      DispatchQueue.global().asyncAfter(deadline: .now() + deadline) { if p.isRunning { p.terminate() } }
+    }
     let data = out.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
     return p.terminationStatus == 0 ? data : nil
@@ -181,7 +186,13 @@ enum Rex {
 
   static func json(_ o: Any) -> String { String(decoding: try! JSONSerialization.data(withJSONObject: o), as: UTF8.self) }
 
-  static func async(_ args: [String], host: String? = nil) { queue.async { run(args, host: host) } }
+  static func async(_ args: [String], host: String? = nil, deadline: TimeInterval? = nil) {
+    queue.async { run(args, host: host, deadline: deadline) }
+  }
+
+  /// How long a refresh, scan, label check or write-back may take: longer on another host, whose server may be busy
+  /// and far away.
+  static func deadline(_ host: String?) -> TimeInterval { host == nil ? 5 : 20 }
 
   /// The server's hosts, as the address of each one's first endpoint.
   static func hosts() -> [String]? {
@@ -215,7 +226,8 @@ enum Rex {
 
   /// The marked pane's label, if it is a terminal block whose label claims it.
   static func label(_ m: Mark, host: String?) -> String? {
-    guard let data = run(["api", "call", "session.list_blocks", json(["session_id": m.session])], host: host),
+    guard let data = run(["api", "call", "session.list_blocks", json(["session_id": m.session])], host: host,
+                         deadline: deadline(host)),
           let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let b = (o["blocks"] as? [[String: Any]] ?? []).first(where: { $0["block_id"] as? String == m.block }),
           b["creator_name"] as? String == "com.superlogical.terminal",
@@ -252,7 +264,7 @@ enum Rex {
 
   /// Every marked, labelled pane on `host`, found in one rex process, or nil if the scan failed.
   static func scan(host: String?) -> [Mark]? {
-    guard let data = run(["do", "-e", scanScript, "--json"], host: host),
+    guard let data = run(["do", "-e", scanScript, "--json"], host: host, deadline: deadline(host)),
           let o = try? JSONSerialization.jsonObject(with: data) else { return nil }
     // Lua writes an empty list as {}.
     let list = o as? [[String: Any]] ?? []
@@ -338,7 +350,8 @@ enum Rex {
   /// from `host`'s server in one rex process.
   static func read(_ panes: [String: [String]], host: String?) -> Readout {
     var r = Readout()
-    guard let data = run(["do", "-e", readScript, "--args", json(["panes": panes]), "--json"], host: host),
+    guard let data = run(["do", "-e", readScript, "--args", json(["panes": panes]), "--json"], host: host,
+                         deadline: deadline(host)),
           let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return r }
     for case let (session, e as [String: Any]) in o {
       if let v = e["view"] as? [String: Any] { r.views[session] = v }
@@ -550,7 +563,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     if let r = reported, let u = web.url, u.absoluteString != r, ["http", "https"].contains(u.scheme?.lowercased()) {
       reported = u.absoluteString
       Rex.async(["do", "-e", Rex.writeBackScript, "--args",
-                 Rex.json(["session": session, "block": id, "url": u.absoluteString])], host: host)
+                 Rex.json(["session": session, "block": id, "url": u.absoluteString])], host: host, deadline: Rex.deadline(host))
     }
     guard let title = (web.title?.isEmpty == false ? web.title : web.url?.host), !title.isEmpty else { return }
     let label = String(title.prefix(80))
