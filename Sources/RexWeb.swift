@@ -190,9 +190,9 @@ enum Rex {
     return (o["hosts"] as? [[String: Any]] ?? []).compactMap { ($0["endpoints"] as? [String])?.first }
   }
 
-  /// A pane that holds a page by convention, such as one `rexweb-remote hold` keeps, sets its terminal title to
-  /// "rexweb URL". Any program can set a title, so a pane counts only if its block label, which only rex calls can
-  /// set, also starts with "rexweb".
+  /// A pane that holds a page by convention, such as one `rexweb-remote hold` keeps, is a terminal block whose title
+  /// is "rexweb URL". Any program can set a title, so a pane counts only if its block label, which only rex calls can
+  /// set, also claims it: see `claims`.
   struct Mark {
     let session, block, url: String
     /// The block's label, once read.
@@ -207,12 +207,20 @@ enum Rex {
     return url
   }
 
-  /// The marked pane's label, if it starts with "rexweb".
+  /// Whether a block label claims its pane for RexWeb: "rexweb" alone, or followed by a space and more.
+  static func claims(label: String) -> Bool { label == "rexweb" || label.hasPrefix("rexweb ") }
+
+  /// The label RexWeb gives an adopted pane that follows its page title.
+  static let titledPrefix = "rexweb · "
+
+  /// The marked pane's label, if it is a terminal block whose label claims it.
   static func label(_ m: Mark, host: String?) -> String? {
     guard let data = run(["api", "call", "session.list_blocks", json(["session_id": m.session])], host: host),
-          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-    let b = (o["blocks"] as? [[String: Any]] ?? []).first { $0["block_id"] as? String == m.block }
-    return (b?["label"] as? String).flatMap { $0.hasPrefix("rexweb") ? $0 : nil }
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let b = (o["blocks"] as? [[String: Any]] ?? []).first(where: { $0["block_id"] as? String == m.block }),
+          b["creator_name"] as? String == "com.superlogical.terminal",
+          let label = b["label"] as? String, claims(label: label) else { return nil }
+    return label
   }
 
   static let scanScript = """
@@ -220,7 +228,8 @@ enum Rex {
   for _, s in ipairs(rex.call("session.list").sessions or {}) do
     rex.session.attach{ session_id = s.session_id }
     for _, b in ipairs((rex.call("session.list_blocks", { session_id = s.session_id }) or {}).blocks or {}) do
-      if b.creator_name == "com.superlogical.terminal" and (b.label or ""):sub(1, 6) == "rexweb" then
+      local l = b.label or ""
+      if b.creator_name == "com.superlogical.terminal" and (l == "rexweb" or l:sub(1, 7) == "rexweb ") then
         local t = (rex.call("block.method", { session_id = s.session_id, block_id = b.block_id, method = "title" }) or {}).title or ""
         if t:sub(1, 7) == "rexweb " then out[#out + 1] = { session = s.session_id, block = b.block_id, title = t, label = b.label } end
       end
@@ -399,7 +408,8 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   let host: String?
   /// For a pane adopted by its label and title, the last URL written to it; nil for a pane that registered itself.
   var reported: String?
-  /// Whether an adopted pane's label follows the page title: only when it was adopted labelled just "rexweb".
+  /// Whether an adopted pane's label follows the page title: when it was adopted labelled just "rexweb", or with a
+  /// label RexWeb gave it.
   var retitles = false
   let window: OverlayWindow
   let web: WKWebView
@@ -531,12 +541,13 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     let label = String(title.prefix(80))
     if label != lastLabel {
       lastLabel = label
-      // A registered pane takes the page title as its label. An adopted pane labelled just "rexweb" takes "rexweb"
-      // and the title, keeping the prefix that lets a scan adopt it again; any other adopted pane keeps its label.
+      // A registered pane takes the page title as its label. An adopted pane that follows its title takes
+      // "rexweb · " and the title, which still claims it after RexWeb restarts; any other adopted pane keeps the
+      // label its creator gave it.
       if reported == nil {
         Rex.setLabel(block: id, session: session, host: host, label)
       } else if retitles {
-        Rex.setLabel(block: id, session: session, host: host, "rexweb " + label)
+        Rex.setLabel(block: id, session: session, host: host, Rex.titledPrefix + label)
       }
     }
   }
@@ -1504,7 +1515,7 @@ final class App: NSObject, NSApplicationDelegate {
   /// Make a panel for a marked, labelled pane, unless it has one.
   func adopt(_ m: Rex.Mark, host: String?) {
     guard panels[m.block] == nil else { return }
-    add(id: m.block, session: m.session, host: host, url: m.url, reported: m.url, retitles: m.label == "rexweb")
+    add(id: m.block, session: m.session, host: host, url: m.url, reported: m.url, retitles: m.label == "rexweb" || m.label.hasPrefix(Rex.titledPrefix))
   }
 
   func resolve(_ raw: Any?) -> Panel? {

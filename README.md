@@ -163,18 +163,18 @@ that your Mac can reach, since the page loads there: `localhost` means the Mac.
 The new pane runs on the remote host, carries the block label `rexweb`, and
 shows the page's address as a link, which is what Rex shows on a phone.
 RexWeb on the Mac follows every host in your Rex host list, finds panes whose
-label starts with `rexweb` and whose terminal title is `rexweb URL`, and draws
-the page over them. It takes only `http` and `https` addresses from a title.
+label is `rexweb`, or `rexweb` followed by a space and more, and whose
+terminal title is `rexweb URL`, and draws the page over them. It takes only `http` and `https` addresses from a title.
 The label is the part a program can't fake by printing a title. A pane
-labelled just `rexweb`, as `rexweb-remote` makes it, is relabelled `rexweb`
-and then the page title; a longer label, such as `rexweb shuttle`, is its
-creator's and stays as it is. From the Mac, `rexweb
+labelled just `rexweb`, as `rexweb-remote` makes it, is relabelled `rexweb · `
+and then the page title, and keeps following the title; any other label, such
+as `rexweb shuttle`, is its creator's and stays as it is. From the Mac, `rexweb
 ls` lists them with the others, and every `rexweb` command works on them. When
 you browse to another page, RexWeb writes its address back to the pane, so the
 link stays current and a restarted RexWeb reopens the page you were on.
 
 The same convention works on the Mac's own Rex server, for any program that
-wants a browser pane without `rexweb-pane`: start a block labelled `rexweb...`
+wants a browser pane without `rexweb-pane`: start a block labelled `rexweb ...`
 whose command sets its terminal title to `rexweb URL` and reads, without
 echoing, the lines RexWeb writes to it. If the title stops being `rexweb URL`,
 as when a Rex server restart leaves the block a plain shell, the page closes.
