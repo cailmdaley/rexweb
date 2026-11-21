@@ -131,6 +131,17 @@ enum RexChrome {
     if let r = config.radius { i.radius = r }
     return i
   }
+
+  /// Whether a sideways two-finger swipe toggles Rex's sidebar, as Rex's settings say: only with vertical tabs and
+  /// trackpad gestures on, by a plain swipe or by an Option-swipe.
+  static func swipeToggles(option: Bool) -> Bool {
+    guard value("tabStyle") as? String == "vertical", (value("usesGestures") as? NSNumber)?.boolValue ?? true else { return false }
+    switch value("sidebarSwipe") as? String ?? "swipe" {
+    case "swipe": return !option
+    case "optionSwipe": return option
+    default: return false
+    }
+  }
 }
 
 func orNull(_ v: Any?) -> Any { v ?? NSNull() }
@@ -282,6 +293,17 @@ enum Rex {
     return (shown, Grid(columns: c, rows: r, cellWidth: w, cellHeight: h))
   }
 
+  /// Ask each Mac Rex app attached to the session named by `rex.args.session` to show or hide its sidebar.
+  static let toggleSidebarScript = """
+  rex.session.attach{ session_id = rex.args.session }
+  for _, c in ipairs(rex.call("session.list_clients", { session_id = rex.args.session }).clients or {}) do
+    local i = c.info or {}
+    if i.kind == "app" and i.platform == "macos" then
+      rex.call("client.perform", { client_id = c.client_id, action = "client.sidebar.toggle" })
+    end
+  end
+  """
+
   static let labelQueue = DispatchQueue(label: "rexweb.label")
   static var pendingLabels: [String: (String, String?, String)] = [:]
   static let labelLock = NSLock()
@@ -299,6 +321,35 @@ enum Rex {
 final class OverlayWindow: NSWindow {
   override var canBecomeKey: Bool { true }
   override var canBecomeMain: Bool { true }
+
+  /// Runs once for each sideways two-finger swipe that Rex's settings make a sidebar toggle.
+  var onSidebarSwipe: (() -> Void)?
+  /// Whether the current trackpad gesture toggles the sidebar, or nil while that's undecided.
+  var swipe: Bool? = false
+  var held: [NSEvent] = []
+  var travel = CGSize.zero
+
+  /// A trackpad gesture's scroll events are held until it has moved 8 points. If it moves mostly sideways and Rex's
+  /// settings make that a sidebar toggle, it calls `onSidebarSwipe` and none of it, momentum included, reaches the
+  /// page. Any other gesture is delivered whole, and a mouse wheel's events pass straight through.
+  override func sendEvent(_ e: NSEvent) {
+    guard e.type == .scrollWheel, !e.phase.isEmpty || !e.momentumPhase.isEmpty else { return super.sendEvent(e) }
+    if swipe != nil, !e.phase.isDisjoint(with: [.mayBegin, .began]) { swipe = nil; held = []; travel = .zero }
+    guard swipe == nil else {
+      if swipe == false { super.sendEvent(e) }
+      return
+    }
+    held.append(e)
+    travel.width += e.scrollingDeltaX
+    travel.height += e.scrollingDeltaY
+    let ended = !e.phase.isDisjoint(with: [.ended, .cancelled]) || !e.momentumPhase.isEmpty
+    guard ended || hypot(travel.width, travel.height) >= 8 else { return }
+    let toggles = !ended && abs(travel.width) > abs(travel.height) && RexChrome.swipeToggles(option: e.modifierFlags.contains(.option))
+    swipe = toggles
+    let events = held
+    held = []
+    if toggles { onSidebarSwipe?() } else { events.forEach { super.sendEvent($0) } }
+  }
 }
 
 final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate {
@@ -362,7 +413,6 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     web.navigationDelegate = self
     web.uiDelegate = self
     web.isInspectable = true
-    web.allowsBackForwardNavigationGestures = true
     web.allowsMagnification = true
 
     for (b, sym, tip, sel) in [(backButton, "chevron.left", "Back", #selector(goBack)),
@@ -390,6 +440,10 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     root.addSubview(bar)
     root.addSubview(web)
     layout()
+    window.onSidebarSwipe = { [weak self] in
+      guard let self else { return }
+      Rex.async(["do", "-e", Rex.toggleSidebarScript, "session=\(self.session)"], host: self.host)
+    }
     NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { [weak self] _ in
       self?.layout()
     }

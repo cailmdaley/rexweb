@@ -84,6 +84,7 @@ pane. Use `--no-wait` to skip the wait.
 | `Cmd`-click a link | Open it in a new pane |
 | `Ctrl-Opt-Arrow` | Move to the Rex pane in that direction |
 | `` Ctrl-Opt-` `` | Back to Rex |
+| Two-finger swipe sideways | Show or hide Rex's sidebar, as Rex's setting *Use a gesture to toggle the sidebar* says; the swipe that doesn't toggle scrolls the page sideways |
 
 Right-click and choose **Inspect Element** for Web Inspector.
 
