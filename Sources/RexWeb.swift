@@ -488,6 +488,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   var lastFrame = NSRect.zero
   var lastActive = Date()
   var focusedInRex = false
+  var yieldFocusUntil = Date.distantPast
   var pendingFocus = false
   var focusURLWhenShown = false
 
@@ -1315,10 +1316,10 @@ final class Tracker {
       }
 
       let isFocused = Tracker.focused(in: v) == p.id
-      if isFocused && !p.focusedInRex && rexActive && frontRex == rw.number {
+      if isFocused && !p.focusedInRex && rexActive && frontRex == rw.number && now >= p.yieldFocusUntil {
         App.shared.focus(p)
       }
-      p.focusedInRex = isFocused
+      p.focusedInRex = isFocused || now < p.yieldFocusUntil
     }
   }
 
@@ -1668,48 +1669,73 @@ final class App: NSObject, NSApplicationDelegate {
 
   func key(_ e: NSEvent) -> Bool {
     guard let p = keyPanel else { return false }
-    let m = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    let m = e.modifierFlags.intersection([.command, .shift, .option, .control])
     let c = e.charactersIgnoringModifiers?.lowercased() ?? ""
     if m == .command {
       switch c {
       case "l": p.focusURL(); return true
       case "r": p.web.reload(); return true
-      case "[": p.web.goBack(); return true
-      case "]": p.web.goForward(); return true
       case "=", "+": p.web.pageZoom = min(3, p.web.pageZoom + 0.1); return true
       case "-": p.web.pageZoom = max(0.3, p.web.pageZoom - 0.1); return true
       case "0": p.web.pageZoom = 1; return true
       case "w": Rex.async(["block", "close", "-s", p.session, p.id], host: p.host); return true
-      case "p": forwardKeyToRex(p, keyCode: e.keyCode, flags: .maskCommand); return true
+      case "[", "]", "p", "b", "t", "1", "2", "3", "4", "5", "6", "7", "8", "9":
+        forwardKeyToRex(p, keyCode: e.keyCode, flags: .maskCommand); return true
       default: break
       }
     }
-    if m == [.command, .shift], c == "r" { p.web.reloadFromOrigin(); return true }
-    if m == [.command, .shift], c == "b" { openPane(beside: p, url: ""); return true }
-    if m == [.command, .shift], c == "p" { performRexAction(p, action: "client.palette.toggle"); return true }
-    if m == [.control, .option] || m == [.control, .option, .function] || m == [.control, .option, .numericPad, .function] {
-      let dir: String? = [123: "left", 124: "right", 125: "down", 126: "up"][Int(e.keyCode)]
-      if let dir { returnToRex(p, focus: dir); return true }
+    if m == [.command, .shift] {
+      if e.keyCode == 36 || e.keyCode == 76 { performRexAction(p, action: "pane.zoom", activate: false); return true }
+      switch c {
+      case "r": p.web.reloadFromOrigin(); return true
+      case "b": openPane(beside: p, url: ""); return true
+      case "p": performRexAction(p, action: "client.palette.toggle"); return true
+      case "[", "{", "]", "}":
+        forwardKeyToRex(p, keyCode: e.keyCode, flags: [.maskCommand, .maskShift]); return true
+      default: break
+      }
     }
-    if m == [.control, .option], c == "`" { returnToRex(p, focus: nil); return true }
+    if m == [.command, .option], (123...126).contains(Int(e.keyCode)) {
+      forwardKeyToRex(p, keyCode: e.keyCode, flags: [.maskCommand, .maskAlternate]); return true
+    }
+    if m == .control, e.keyCode == 48 || e.keyCode == 36 || e.keyCode == 76 {
+      forwardKeyToRex(p, keyCode: e.keyCode, flags: .maskControl); return true
+    }
+    if m == [.control, .shift], e.keyCode == 48 || e.keyCode == 36 || e.keyCode == 76 {
+      forwardKeyToRex(p, keyCode: e.keyCode, flags: [.maskControl, .maskShift]); return true
+    }
+    if m == [.control, .option] {
+      if let dir = [123: "left", 124: "right", 125: "down", 126: "up"][Int(e.keyCode)] {
+        returnToRex(p, focus: dir); return true
+      }
+      if c == "`" { returnToRex(p, focus: nil); return true }
+    }
     return false
   }
 
   func returnToRex(_ p: Panel, focus dir: String?) {
     p.focusedInRex = true
+    p.yieldFocusUntil = Date().addingTimeInterval(0.35)
+    tracker.wake()
     activateRex()
     if let dir { Rex.async(["focus", "-s", p.session, "-b", p.id, dir], host: p.host) }
   }
 
-  func performRexAction(_ p: Panel, action: String) {
-    p.focusedInRex = true
-    activateRex()
+  func performRexAction(_ p: Panel, action: String, activate: Bool = true) {
+    if activate {
+      p.focusedInRex = true
+      p.yieldFocusUntil = Date().addingTimeInterval(0.35)
+      activateRex()
+    }
+    tracker.wake()
     Rex.async(["do", "-e", Rex.performActionScript, "--args",
                Rex.json(["session": p.session, "action": action])], host: p.host)
   }
 
   func forwardKeyToRex(_ p: Panel, keyCode: UInt16, flags: CGEventFlags) {
     p.focusedInRex = true
+    p.yieldFocusUntil = Date().addingTimeInterval(0.35)
+    tracker.wake()
     guard let rex = rexApp() else { return }
     rex.activate()
     let pid = rex.processIdentifier
@@ -1736,6 +1762,7 @@ final class App: NSObject, NSApplicationDelegate {
 
   func focus(_ p: Panel) {
     p.lastActive = Date()
+    p.yieldFocusUntil = .distantPast
     guard p.visible else { p.pendingFocus = true; return }
     NSApp.activate(ignoringOtherApps: true)
     p.window.makeKey()
