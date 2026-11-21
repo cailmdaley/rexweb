@@ -181,11 +181,6 @@ enum Rex {
 
   static func json(_ o: Any) -> String { String(decoding: try! JSONSerialization.data(withJSONObject: o), as: UTF8.self) }
 
-  static func view(_ session: String, host: String?) -> [String: Any]? {
-    guard let data = run(["api", "call", "session.view", json(["session_id": session])], host: host) else { return nil }
-    return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-  }
-
   static func async(_ args: [String], host: String? = nil) { queue.async { run(args, host: host) } }
 
   /// The server's hosts, as the address of each one's first endpoint.
@@ -287,13 +282,50 @@ enum Rex {
 
   struct Grid { let columns, rows, cellWidth, cellHeight: Double }
 
-  static func size(block: String, session: String, host: String?) -> (displayed: Bool, grid: Grid?)? {
-    guard let data = run(["block", "call", "-s", session, "-b", block, "size"], host: host),
-          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-    let shown = !((o["desired"] as? [Any]) ?? []).isEmpty
-    func n(_ k: String) -> Double? { (o[k] as? NSNumber)?.doubleValue }
-    guard let c = n("columns"), let r = n("rows"), let w = n("cell_width_px"), let h = n("cell_height_px") else { return (shown, nil) }
-    return (shown, Grid(columns: c, rows: r, cellWidth: w, cellHeight: h))
+  /// For each session in `rex.args.panes`, its view and the size of each of its blocks listed there. A session or
+  /// block that is gone is left out.
+  static let readScript = """
+  local out = {}
+  for s, blocks in pairs(rex.args.panes) do
+    local r = { sizes = {} }
+    if pcall(rex.session.attach, { session_id = s }) then
+      local ok, v = pcall(rex.call, "session.view", { session_id = s })
+      if ok then r.view = v end
+      for _, b in ipairs(blocks) do
+        local ok, z = pcall(rex.call, "block.method", { session_id = s, block_id = b, method = "size" })
+        if ok then r.sizes[b] = z end
+      end
+    end
+    out[s] = r
+  end
+  return out
+  """
+
+  struct Readout {
+    var views: [String: [String: Any]] = [:]
+    /// Whether a Rex app is showing each pane, and its terminal grid when the size gives one.
+    var shown: [String: Bool] = [:]
+    var grids: [String: Grid] = [:]
+  }
+
+  /// The views of the sessions in `panes`, a session's ID to its blocks' IDs, and the sizes of those blocks, read
+  /// from `host`'s server in one rex process.
+  static func read(_ panes: [String: [String]], host: String?) -> Readout {
+    var r = Readout()
+    guard let data = run(["do", "-e", readScript, "--args", json(["panes": panes]), "--json"], host: host),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return r }
+    for case let (session, e as [String: Any]) in o {
+      if let v = e["view"] as? [String: Any] { r.views[session] = v }
+      for case let (block, z as [String: Any]) in e["sizes"] as? [String: Any] ?? [:] {
+        // Lua writes an empty list as {}, so only a list is a nonempty one.
+        r.shown[block] = (z["desired"] as? [Any])?.isEmpty == false
+        func n(_ k: String) -> Double? { (z[k] as? NSNumber)?.doubleValue }
+        if let c = n("columns"), let h = n("rows"), let cw = n("cell_width_px"), let ch = n("cell_height_px") {
+          r.grids[block] = Grid(columns: c, rows: h, cellWidth: cw, cellHeight: ch)
+        }
+      }
+    }
+    return r
   }
 
   /// Ask each Mac Rex app attached to the session named by `rex.args.session` to show or hide its sidebar.
@@ -773,6 +805,7 @@ final class Tracker {
   var grids: [String: Rex.Grid] = [:]
   var windowSession: [Int: String] = [:]
   var pendingPair: (Int, String)?
+  /// Servers with a refresh running, and those to refresh again when it ends, keyed as `streams` is.
   var refreshing = Set<String>()
   var dirty = Set<String>()
   /// One `rex events` stream per server: "" for the local server, else a host's address.
@@ -813,8 +846,8 @@ final class Tracker {
     }
   }
 
-  /// Stream a server's events, the local server's and each host's alike: a layout change refreshes that session's
-  /// panels and rescans the server, a marked, labelled pane becomes a panel, and an adopted pane whose title loses
+  /// Stream a server's events, the local server's and each host's alike: a layout change refreshes the server's
+  /// panels and rescans it, a marked, labelled pane becomes a panel, and an adopted pane whose title loses
   /// its mark loses its panel. Each time a stream starts, a scan adopts the marked panes already there and closes
   /// the panels of panes that lost their mark meanwhile, as a Rex server restart leaves them.
   func startEvents(_ host: String?) {
@@ -849,8 +882,8 @@ final class Tracker {
             DispatchQueue.main.async { if self.unmarked[host ?? ""]?.contains(m.block) != true { App.shared.adopt(m, host: host) } }
           }
         }
-        sessions.forEach { self.refresh($0) }
         if !sessions.isEmpty { self.scan(host) }
+        if App.shared.panels.values.contains(where: { $0.host == host && sessions.contains($0.session) }) { self.refresh(host) }
       }
     }
     let started = Date()
@@ -890,30 +923,26 @@ final class Tracker {
   }
 
   func refreshAll() {
-    Set(App.shared.panels.values.map(\.session)).forEach(refresh)
+    Set(App.shared.panels.values.map(\.host)).forEach(refresh)
   }
 
-  func refresh(_ session: String) {
-    let mine = App.shared.panels.values.filter { $0.session == session }
-    if mine.isEmpty { return }
-    if refreshing.contains(session) { dirty.insert(session); return }
-    refreshing.insert(session)
-    let ids = mine.map(\.id), host = mine.first?.host
+  /// Read the views and pane sizes of `host`'s panels, in one rex process for the whole server. One refresh runs per
+  /// server at a time; one asked for meanwhile runs when it ends.
+  func refresh(_ host: String?) {
+    let key = host ?? ""
+    if refreshing.contains(key) { dirty.insert(key); return }
+    var panes: [String: [String]] = [:]
+    for p in App.shared.panels.values where p.host == host { panes[p.session, default: []].append(p.id) }
+    if panes.isEmpty { return }
+    refreshing.insert(key)
     Rex.queue.async {
-      let v = Rex.view(session, host: host)
-      var shown: [String: Bool] = [:]
-      var grids: [String: Rex.Grid] = [:]
-      for id in ids {
-        guard let sz = Rex.size(block: id, session: session, host: host) else { continue }
-        shown[id] = sz.displayed
-        if let g = sz.grid { grids[id] = g }
-      }
+      let r = Rex.read(panes, host: host)
       DispatchQueue.main.async {
-        self.refreshing.remove(session)
-        for (id, d) in shown { self.displayed[id] = d }
-        for (id, g) in grids { self.grids[id] = g }
-        if let v { self.views[session] = v; self.reconcile(session, ids) }
-        if self.dirty.remove(session) != nil { self.refresh(session) }
+        self.refreshing.remove(key)
+        self.displayed.merge(r.shown) { $1 }
+        self.grids.merge(r.grids) { $1 }
+        for (session, v) in r.views { self.views[session] = v; self.reconcile(session, panes[session] ?? []) }
+        if self.dirty.remove(key) != nil { self.refresh(host) }
       }
     }
   }
@@ -1451,7 +1480,7 @@ final class App: NSObject, NSApplicationDelegate {
     let p = Panel(id: id, session: session, host: host)
     p.reported = reported
     panels[id] = p
-    tracker.refresh(session)
+    tracker.refresh(host)
     if !url.isEmpty { p.load(url) }
     log("pane \(id.suffix(6)) registered\(host.map { " on \($0)" } ?? "")")
     return p
