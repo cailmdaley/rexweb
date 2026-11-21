@@ -1788,7 +1788,7 @@ final class App: NSObject, NSApplicationDelegate {
     let command = p.host == nil
       ? ["--label", "browser", "--shell=none", "--", "env", "REXWEB_FOCUS=true", pane, url]
       : ["--label", "rexweb", "--", "rexweb-remote", "hold", url]
-    Rex.async(["split", "-s", p.session, "-b", p.id, "--split=right"] + command, host: p.host)
+    Rex.async(["split", "-s", p.session, "-b", p.id, "--split=down"] + command, host: p.host)
   }
 
   @discardableResult
