@@ -142,6 +142,32 @@ enum RexChrome {
     default: return false
     }
   }
+
+  /// Parse an AppKit `NSWindow Frame <name>` preference value into CoreGraphics screen coordinates (top-left origin).
+  static func windowFrame(_ key: String, primaryHeight: CGFloat) -> CGRect? {
+    guard let s = CFPreferencesCopyAppValue("NSWindow Frame \(key)" as CFString, domain) as? String else { return nil }
+    let nums = s.split(separator: " ").compactMap { Double($0) }
+    guard nums.count >= 4 else { return nil }
+    return CGRect(x: nums[0], y: Double(primaryHeight) - nums[1] - nums[3], width: nums[2], height: nums[3])
+  }
+
+  /// The saved frame of Rex's Settings window when it is distinct from Rex's saved workspace window frames,
+  /// so Settings can be recognized even without Screen Recording permission (when window titles are empty).
+  static func settingsFrame(primaryHeight: CGFloat) -> CGRect? {
+    let settingsKey = "NSWindow Frame com_apple_SwiftUI_Settings_window"
+    guard let sf = windowFrame("com_apple_SwiftUI_Settings_window", primaryHeight: primaryHeight) else { return nil }
+    let keys = (CFPreferencesCopyKeyList(domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? [String]) ?? []
+    for k in keys where k.hasPrefix("NSWindow Frame ") && k != settingsKey {
+      let name = String(k.dropFirst("NSWindow Frame ".count))
+      if let wf = windowFrame(name, primaryHeight: primaryHeight), framesMatch(wf, sf) { return nil }
+    }
+    return sf
+  }
+
+  static func framesMatch(_ a: CGRect, _ b: CGRect, tolerance: CGFloat = 2) -> Bool {
+    abs(a.origin.x - b.origin.x) <= tolerance && abs(a.origin.y - b.origin.y) <= tolerance
+      && abs(a.size.width - b.size.width) <= tolerance && abs(a.size.height - b.size.height) <= tolerance
+  }
 }
 
 func orNull(_ v: Any?) -> Any { v ?? NSNull() }
@@ -460,8 +486,6 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   var lastLabel = ""
   var visible = false
   var lastFrame = NSRect.zero
-  var layoutKey = ""
-  var settleUntil = Date.distantPast
   var lastActive = Date()
   var focusedInRex = false
   var pendingFocus = false
@@ -524,6 +548,10 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     urlField.target = self
     urlField.action = #selector(submitURL)
     bar.addSubview(urlField)
+
+    bar.autoresizingMask = [.width, .minYMargin]
+    urlField.autoresizingMask = [.width]
+    web.autoresizingMask = [.width, .height]
 
     root.addSubview(bar)
     root.addSubview(web)
@@ -866,6 +894,10 @@ final class Tracker {
   var displayed: [String: Bool] = [:]
   var grids: [String: Rex.Grid] = [:]
   var windowSession: [Int: String] = [:]
+  /// Window numbers recognized as non-session Rex windows (such as Settings) by their saved frame when window names
+  /// aren't readable, kept until the window closes so moving or resizing it doesn't re-admit it.
+  var nonSessionWindows = Set<Int>()
+  var settingsFrame: CGRect?
   var pendingPair: (Int, String)?
   /// Servers with a refresh running, and those to refresh again when it ends, keyed as `streams` is.
   var refreshing = Set<String>()
@@ -1074,9 +1106,17 @@ final class Tracker {
     return out
   }
 
-  static func rexWindows() -> (rex: [RexWindow], order: [Int]) {
+  /// Whether a non-empty Rex window title belongs to a non-session window such as Settings or an updater.
+  static func isAuxiliaryWindowName(_ name: String) -> Bool {
+    name == "Settings" || name.hasPrefix("Settings - ") || name.hasPrefix("Settings — ")
+      || name == "About Rex" || name.hasPrefix("About Rex ")
+      || name == "Software Update" || name.hasPrefix("Updating ")
+  }
+
+  static func rexWindows() -> (rex: [RexWindow], allRex: Set<Int>, order: [Int]) {
     let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
     var rex: [RexWindow] = []
+    var allRex = Set<Int>()
     var order: [Int] = []
     for w in list {
       guard let n = w[kCGWindowNumber as String] as? Int else { continue }
@@ -1084,11 +1124,28 @@ final class Tracker {
       let owner = w[kCGWindowOwnerName as String] as? String ?? ""
       let layer = w[kCGWindowLayer as String] as? Int ?? 0
       guard layer == 0, owner == "Rex" || owner.hasPrefix("Rex ") else { continue }
+      allRex.insert(n)
       guard let bd = w[kCGWindowBounds as String] as? NSDictionary,
             let r = CGRect(dictionaryRepresentation: bd), r.width > 200, r.height > 200 else { continue }
-      rex.append(RexWindow(number: n, name: w[kCGWindowName as String] as? String ?? "", bounds: r))
+      let name = w[kCGWindowName as String] as? String ?? ""
+      if !name.isEmpty, isAuxiliaryWindowName(name) { continue }
+      rex.append(RexWindow(number: n, name: name, bounds: r))
     }
-    return (rex, order)
+    return (rex, allRex, order)
+  }
+
+  func filterSessionWindows(_ wins: [RexWindow]) -> [RexWindow] {
+    guard let sf = settingsFrame else {
+      return wins.filter { !nonSessionWindows.contains($0.number) }
+    }
+    return wins.filter { w in
+      if nonSessionWindows.contains(w.number) { return false }
+      if windowSession[w.number] == nil && RexChrome.framesMatch(w.bounds, sf) {
+        nonSessionWindows.insert(w.number)
+        return false
+      }
+      return true
+    }
   }
 
   static func placement(of id: String, in view: [String: Any]) -> (rect: CGRect, floating: Bool)? {
@@ -1143,16 +1200,22 @@ final class Tracker {
     // With no panel to show or hide, the window list matters only for learning Rex's windows while Rex is in front.
     let active = panels.contains { displayed[$0.id] == true || $0.visible }
     if !active && !rexActive { return }
-    let (rexWins, order) = Tracker.rexWindows()
+    let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+    if now.timeIntervalSince(insetsRead) >= 0.2 {
+      insetsRead = now
+      insets = RexChrome.read()
+      settingsFrame = RexChrome.settingsFrame(primaryHeight: primaryHeight)
+    }
+    let (rawRexWins, allRex, order) = Tracker.rexWindows()
+    let rexWins = filterSessionWindows(rawRexWins)
     if now.timeIntervalSince(learned) >= 0.2 { learned = now; learnWindows(rexWins) }
     if !active { return }
-    if now.timeIntervalSince(insetsRead) >= 0.2 { insetsRead = now; insets = RexChrome.read() }
-    let ours = Set(panels.map { $0.window.windowNumber }), theirs = Set(rexWins.map(\.number))
+    let ours = Set(panels.map { $0.window.windowNumber })
     let places: [String] = rexWins.map { w in "\(w.number) \(w.bounds)" }
-    let stack: [Int] = order.filter { n in ours.contains(n) || theirs.contains(n) }
+    let stack: [Int] = order.filter { n in ours.contains(n) || allRex.contains(n) }
     let seen = "\(places) \(stack) \(insets)"
     if seen != scene { scene = seen; hotUntil = max(hotUntil, now.addingTimeInterval(1)) }
-    let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+    let frontRex = order.first { allRex.contains($0) }
 
     for p in panels {
       guard displayed[p.id] == true, let v = views[p.session], let place = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
@@ -1160,21 +1223,20 @@ final class Tracker {
       let frac = place.rect
       guard let rw = window(for: p, place, v, rexWins, primaryHeight) else { hide(p); continue }
 
-      let key = "\(frac) \(place.floating) \(rw.number)"
-      if key != p.layoutKey {
-        p.layoutKey = key
-        p.settleUntil = Date().addingTimeInterval(0.4)
-        hotUntil = max(hotUntil, p.settleUntil.addingTimeInterval(0.1))
-        if p.window.isKeyWindow { p.pendingFocus = true }
-      }
-      if Date() < p.settleUntil { hide(p); continue }
       let (body, radius) = Tracker.body(frac, floating: place.floating, in: rw.bounds, ins)
       if let l = p.window.contentView?.layer, l.cornerRadius != CGFloat(radius) { l.cornerRadius = CGFloat(radius) }
       guard body.width > 20, body.height > 20 else { hide(p); continue }
       let x0 = (body.minX).rounded(.up), x1 = (body.maxX).rounded(.down)
       let y0 = (body.minY).rounded(.up), y1 = (body.maxY).rounded(.down)
       let ns = NSRect(x: x0, y: primaryHeight - y1, width: x1 - x0, height: y1 - y0)
-      if ns != p.lastFrame { p.window.setFrame(ns, display: true); p.lastFrame = ns }
+      if ns != p.lastFrame {
+        if ns.size == p.lastFrame.size {
+          p.window.setFrameOrigin(ns.origin)
+        } else {
+          p.window.setFrame(ns, display: false)
+        }
+        p.lastFrame = ns
+      }
 
       let mine = p.window.windowNumber
       let iMine = order.firstIndex(of: mine), iRex = order.firstIndex(of: rw.number)
@@ -1186,11 +1248,11 @@ final class Tracker {
       p.visible = true
       if p.pendingFocus {
         p.pendingFocus = false
-        App.shared.focus(p)
+        if frontRex == rw.number { App.shared.focus(p) }
       }
 
       let isFocused = Tracker.focused(in: v) == p.id
-      if isFocused && !p.focusedInRex && rexActive {
+      if isFocused && !p.focusedInRex && rexActive && frontRex == rw.number {
         App.shared.focus(p)
       }
       p.focusedInRex = isFocused
@@ -1203,12 +1265,20 @@ final class Tracker {
           let data = RexChrome.value("lastFocusedSession") as? Data,
           let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let session = o["sessionID"] as? String else { pendingPair = nil; return }
+    // Don't steal a session from a Rex window that is still on screen and paired with it: opening a non-session
+    // window (Settings, About, updater) brings it to the front without changing lastFocusedSession.
+    if windowSession[front.number] == nil,
+       wins.contains(where: { $0.number != front.number && windowSession[$0.number] == session }) {
+      pendingPair = nil
+      return
+    }
     if let p = pendingPair, p.0 == front.number, p.1 == session, windowSession[front.number] != session {
       // A hidden Rex window keeps its session, so a pane of another session isn't drawn on it when it comes back; a
       // closed one gives it up.
       let all = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
       let live = Set(all.compactMap { $0[kCGWindowNumber as String] as? Int })
       windowSession = windowSession.filter { live.contains($0.key) && $0.value != session }
+      nonSessionWindows = nonSessionWindows.intersection(live)
       windowSession[front.number] = session
     }
     pendingPair = (front.number, session)
@@ -1638,7 +1708,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     switch route {
     case "/health":
-      let wins = Tracker.rexWindows().rex
+      let wins = tracker.filterSessionWindows(Tracker.rexWindows().rex)
       return ok([
         "ok": true, "pid": ProcessInfo.processInfo.processIdentifier, "panels": panels.count,
         "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
