@@ -404,13 +404,13 @@ enum Rex {
     return r
   }
 
-  /// Ask each Mac Rex app attached to the session named by `rex.args.session` to show or hide its sidebar.
-  static let toggleSidebarScript = """
+  /// Ask each Mac Rex app attached to the session named by `rex.args.session` to perform `rex.args.action`.
+  static let performActionScript = """
   rex.session.attach{ session_id = rex.args.session }
   for _, c in ipairs(rex.call("session.list_clients", { session_id = rex.args.session }).clients or {}) do
     local i = c.info or {}
     if i.kind == "app" and i.platform == "macos" then
-      rex.call("client.perform", { client_id = c.client_id, action = "client.sidebar.toggle" })
+      rex.call("client.perform", { client_id = c.client_id, action = rex.args.action })
     end
   end
   """
@@ -558,7 +558,8 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     layout()
     window.onSidebarSwipe = { [weak self] in
       guard let self else { return }
-      Rex.async(["do", "-e", Rex.toggleSidebarScript, "session=\(self.session)"], host: self.host)
+      Rex.async(["do", "-e", Rex.performActionScript, "--args",
+                 Rex.json(["session": self.session, "action": "client.sidebar.toggle"])], host: self.host)
     }
     NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { [weak self] _ in
       self?.layout()
@@ -919,6 +920,9 @@ final class Tracker {
   var rexActive = Tracker.isRex(NSWorkspace.shared.frontmostApplication)
   /// `tick` runs every frame until this time, and every `idleInterval` after it.
   var hotUntil = Date.distantPast
+  /// While before this time, all panels stay hidden (e.g. while a Rex picker or palette is open).
+  var suspendedUntil = Date.distantPast
+  var isSuspended: Bool { Date() < suspendedUntil }
   var tickTimer: Timer?
   /// What the last tick saw of the Rex windows, the stacking order of theirs and ours, and Rex's chrome.
   var scene = ""
@@ -933,6 +937,20 @@ final class Tracker {
   func wake(_ seconds: TimeInterval = 1) {
     hotUntil = max(hotUntil, Date().addingTimeInterval(seconds))
     schedule(Tracker.frameInterval)
+  }
+
+  /// Hide all panels until `resume()` is called or `seconds` elapse.
+  func suspend(seconds: TimeInterval) {
+    suspendedUntil = Date().addingTimeInterval(max(0, seconds))
+    for p in App.shared.panels.values { hide(p) }
+    wake()
+  }
+
+  /// Cancel an active suspension and restore panels immediately.
+  func resume() {
+    suspendedUntil = .distantPast
+    wake()
+    tick()
   }
 
   func schedule(_ interval: TimeInterval) {
@@ -1113,39 +1131,70 @@ final class Tracker {
       || name == "Software Update" || name.hasPrefix("Updating ")
   }
 
-  static func rexWindows() -> (rex: [RexWindow], allRex: Set<Int>, order: [Int]) {
+  static func rexWindows() -> (rex: [RexWindow], overlays: [RexWindow], allRex: Set<Int>, order: [Int], namesReadable: Bool) {
     let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-    var rex: [RexWindow] = []
+    var candidates: [RexWindow] = []
+    var overlays: [RexWindow] = []
     var allRex = Set<Int>()
     var order: [Int] = []
+    var namesReadable = false
     for w in list {
       guard let n = w[kCGWindowNumber as String] as? Int else { continue }
       order.append(n)
       let owner = w[kCGWindowOwnerName as String] as? String ?? ""
       let layer = w[kCGWindowLayer as String] as? Int ?? 0
-      guard layer == 0, owner == "Rex" || owner.hasPrefix("Rex ") else { continue }
-      allRex.insert(n)
+      guard owner == "Rex" || owner.hasPrefix("Rex ") else { continue }
       guard let bd = w[kCGWindowBounds as String] as? NSDictionary,
-            let r = CGRect(dictionaryRepresentation: bd), r.width > 200, r.height > 200 else { continue }
+            let r = CGRect(dictionaryRepresentation: bd) else { continue }
       let name = w[kCGWindowName as String] as? String ?? ""
-      if !name.isEmpty, isAuxiliaryWindowName(name) { continue }
-      rex.append(RexWindow(number: n, name: name, bounds: r))
+      if layer == 0 {
+        allRex.insert(n)
+        if !name.isEmpty { namesReadable = true }
+        guard r.width > 200, r.height > 200 else { continue }
+        if !name.isEmpty, isAuxiliaryWindowName(name) { continue }
+        candidates.append(RexWindow(number: n, name: name, bounds: r))
+      } else if layer > 0 && layer <= 101, r.width > 200, r.height > 150 {
+        allRex.insert(n)
+        overlays.append(RexWindow(number: n, name: name, bounds: r))
+      }
     }
-    return (rex, allRex, order)
+    var rex: [RexWindow] = []
+    if namesReadable {
+      for w in candidates {
+        if w.name.isEmpty { overlays.append(w) } else { rex.append(w) }
+      }
+    } else {
+      rex = candidates
+    }
+    return (rex, overlays, allRex, order, namesReadable)
   }
 
-  func filterSessionWindows(_ wins: [RexWindow]) -> [RexWindow] {
-    guard let sf = settingsFrame else {
-      return wins.filter { !nonSessionWindows.contains($0.number) }
-    }
-    return wins.filter { w in
-      if nonSessionWindows.contains(w.number) { return false }
-      if windowSession[w.number] == nil && RexChrome.framesMatch(w.bounds, sf) {
+  func filterSessionWindows(_ wins: [RexWindow], namesReadable: Bool) -> (rex: [RexWindow], overlays: [RexWindow]) {
+    var kept: [RexWindow] = []
+    for w in wins {
+      if nonSessionWindows.contains(w.number) { continue }
+      if let sf = settingsFrame, windowSession[w.number] == nil, RexChrome.framesMatch(w.bounds, sf) {
         nonSessionWindows.insert(w.number)
-        return false
+        continue
       }
-      return true
+      kept.append(w)
     }
+    if namesReadable { return (kept, []) }
+    // Without Screen Recording permission window titles are empty, so detect a centered palette/sheet window
+    // sitting strictly inside a larger Rex window behind it in stacking order.
+    var rex: [RexWindow] = []
+    var overlays: [RexWindow] = []
+    for (i, w) in kept.enumerated() {
+      let isCenteredOverlay = windowSession[w.number] == nil
+        && w.bounds.width <= 700
+        && kept[(i + 1)...].contains { bg in
+          bg.bounds.contains(w.bounds)
+            && w.bounds.width < bg.bounds.width * 0.75
+            && abs(w.bounds.midX - bg.bounds.midX) < 40
+        }
+      if isCenteredOverlay { overlays.append(w) } else { rex.append(w) }
+    }
+    return (rex, overlays)
   }
 
   static func placement(of id: String, in view: [String: Any]) -> (rect: CGRect, floating: Bool)? {
@@ -1197,6 +1246,10 @@ final class Tracker {
     let now = Date()
     defer { schedule(now < hotUntil ? Tracker.frameInterval : Tracker.idleInterval) }
     let panels = App.shared.panels.values
+    if now < suspendedUntil {
+      for p in panels { hide(p) }
+      return
+    }
     // With no panel to show or hide, the window list matters only for learning Rex's windows while Rex is in front.
     let active = panels.contains { displayed[$0.id] == true || $0.visible }
     if !active && !rexActive { return }
@@ -1206,8 +1259,9 @@ final class Tracker {
       insets = RexChrome.read()
       settingsFrame = RexChrome.settingsFrame(primaryHeight: primaryHeight)
     }
-    let (rawRexWins, allRex, order) = Tracker.rexWindows()
-    let rexWins = filterSessionWindows(rawRexWins)
+    let (rawRexWins, rawOverlays, allRex, order, namesReadable) = Tracker.rexWindows()
+    let (rexWins, extraOverlays) = filterSessionWindows(rawRexWins, namesReadable: namesReadable)
+    let overlays = rawOverlays + extraOverlays
     if now.timeIntervalSince(learned) >= 0.2 { learned = now; learnWindows(rexWins) }
     if !active { return }
     let ours = Set(panels.map { $0.window.windowNumber })
@@ -1215,6 +1269,7 @@ final class Tracker {
     let stack: [Int] = order.filter { n in ours.contains(n) || allRex.contains(n) }
     let seen = "\(places) \(stack) \(insets)"
     if seen != scene { scene = seen; hotUntil = max(hotUntil, now.addingTimeInterval(1)) }
+    if !overlays.isEmpty { hotUntil = max(hotUntil, now.addingTimeInterval(0.5)) }
     let frontRex = order.first { allRex.contains($0) }
 
     for p in panels {
@@ -1222,6 +1277,14 @@ final class Tracker {
       let ins = insets
       let frac = place.rect
       guard let rw = window(for: p, place, v, rexWins, primaryHeight) else { hide(p); continue }
+      if let iRex = order.firstIndex(of: rw.number),
+         overlays.contains(where: { ov in
+           guard let iOv = order.firstIndex(of: ov.number) else { return false }
+           return iOv < iRex && ov.bounds.intersects(rw.bounds)
+         }) {
+        hide(p)
+        continue
+      }
 
       let (body, radius) = Tracker.body(frac, floating: place.floating, in: rw.bounds, ins)
       if let l = p.window.contentView?.layer, l.cornerRadius != CGFloat(radius) { l.cornerRadius = CGFloat(radius) }
@@ -1617,11 +1680,13 @@ final class App: NSObject, NSApplicationDelegate {
       case "-": p.web.pageZoom = max(0.3, p.web.pageZoom - 0.1); return true
       case "0": p.web.pageZoom = 1; return true
       case "w": Rex.async(["block", "close", "-s", p.session, p.id], host: p.host); return true
+      case "p": forwardKeyToRex(p, keyCode: e.keyCode, flags: .maskCommand); return true
       default: break
       }
     }
     if m == [.command, .shift], c == "r" { p.web.reloadFromOrigin(); return true }
     if m == [.command, .shift], c == "b" { openPane(beside: p, url: ""); return true }
+    if m == [.command, .shift], c == "p" { performRexAction(p, action: "client.palette.toggle"); return true }
     if m == [.control, .option] || m == [.control, .option, .function] || m == [.control, .option, .numericPad, .function] {
       let dir: String? = [123: "left", 124: "right", 125: "down", 126: "up"][Int(e.keyCode)]
       if let dir { returnToRex(p, focus: dir); return true }
@@ -1636,9 +1701,37 @@ final class App: NSObject, NSApplicationDelegate {
     if let dir { Rex.async(["focus", "-s", p.session, "-b", p.id, dir], host: p.host) }
   }
 
+  func performRexAction(_ p: Panel, action: String) {
+    p.focusedInRex = true
+    activateRex()
+    Rex.async(["do", "-e", Rex.performActionScript, "--args",
+               Rex.json(["session": p.session, "action": action])], host: p.host)
+  }
+
+  func forwardKeyToRex(_ p: Panel, keyCode: UInt16, flags: CGEventFlags) {
+    p.focusedInRex = true
+    guard let rex = rexApp() else { return }
+    rex.activate()
+    let pid = rex.processIdentifier
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+      let src = CGEventSource(stateID: .hidSystemState)
+      for down in [true, false] {
+        guard let ev = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: down) else { continue }
+        ev.flags = flags
+        ev.postToPid(pid)
+      }
+    }
+  }
+
+  func rexApp() -> NSRunningApplication? {
+    NSRunningApplication.runningApplications(withBundleIdentifier: "com.superlogical.rex").first
+      ?? NSWorkspace.shared.runningApplications.first {
+        (Tracker.isRex($0) || $0.localizedName?.hasPrefix("Rex") == true) && $0.activationPolicy == .regular
+      }
+  }
+
   func activateRex() {
-    _ = NSRunningApplication.runningApplications(withBundleIdentifier: "com.superlogical.rex").first?.activate()
-      ?? NSWorkspace.shared.runningApplications.first { $0.localizedName?.hasPrefix("Rex") == true && $0.activationPolicy == .regular }?.activate()
+    _ = rexApp()?.activate()
   }
 
   func focus(_ p: Panel) {
@@ -1708,15 +1801,24 @@ final class App: NSObject, NSApplicationDelegate {
 
     switch route {
     case "/health":
-      let wins = tracker.filterSessionWindows(Tracker.rexWindows().rex)
+      let rw = Tracker.rexWindows()
+      let wins = tracker.filterSessionWindows(rw.rex, namesReadable: rw.namesReadable).rex
       return ok([
         "ok": true, "pid": ProcessInfo.processInfo.processIdentifier, "panels": panels.count,
         "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
         "port": config.port, "rex_bin": config.rexBin, "rex_version": orNull(Rex.version),
         "rex_windows": wins.count,
         "window_names": wins.isEmpty ? NSNull() as Any : wins.contains { !$0.name.isEmpty } as Any,
+        "suspended": tracker.isSuspended,
         "config_error": orNull(config.configError),
       ])
+    case "/suspend":
+      let seconds = max(0, (input["seconds"] as? NSNumber)?.doubleValue ?? 60)
+      tracker.suspend(seconds: seconds)
+      return ok(["ok": true, "suspended": tracker.isSuspended, "seconds": seconds])
+    case "/resume":
+      tracker.resume()
+      return ok(["ok": true, "suspended": false])
     case "/list":
       return ok(["panels": panels.values.sorted { $0.lastActive > $1.lastActive }.map { $0.info() }])
     case "/register":
