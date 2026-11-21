@@ -171,6 +171,12 @@ ls` lists them with the others, and every `rexweb` command works on them. When
 you browse to another page, RexWeb writes its address back to the pane, so the
 link stays current and a restarted RexWeb reopens the page you were on.
 
+The same convention works on the Mac's own Rex server, for any program that
+wants a browser pane without `rexweb-pane`: start a block labelled `rexweb...`
+whose command sets its terminal title to `rexweb URL` and reads, without
+echoing, the lines RexWeb writes to it. If the title stops being `rexweb URL`,
+as when a Rex server restart leaves the block a plain shell, the page closes.
+
 ## Signing in
 
 All browser panes share one profile. It survives restarts. You sign in to a

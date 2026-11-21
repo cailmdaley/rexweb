@@ -195,8 +195,9 @@ enum Rex {
     return (o["hosts"] as? [[String: Any]] ?? []).compactMap { ($0["endpoints"] as? [String])?.first }
   }
 
-  /// A pane that `rexweb-remote hold` keeps sets its terminal title to "rexweb URL". Any program can set a title, so
-  /// a pane counts only if its block label, which only rex calls can set, also starts with "rexweb".
+  /// A pane that holds a page by convention, such as one `rexweb-remote hold` keeps, sets its terminal title to
+  /// "rexweb URL". Any program can set a title, so a pane counts only if its block label, which only rex calls can
+  /// set, also starts with "rexweb".
   struct Mark { let session, block, url: String }
 
   /// The URL in a marked title: an http or https address, or empty for a blank page.
@@ -228,10 +229,12 @@ enum Rex {
   return out
   """
 
-  /// Every marked, labelled pane on `host`, found in one rex process.
-  static func scan(host: String?) -> [Mark] {
+  /// Every marked, labelled pane on `host`, found in one rex process, or nil if the scan failed.
+  static func scan(host: String?) -> [Mark]? {
     guard let data = run(["do", "-e", scanScript, "--json"], host: host),
-          let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+          let o = try? JSONSerialization.jsonObject(with: data) else { return nil }
+    // Lua writes an empty list as {}.
+    let list = o as? [[String: Any]] ?? []
     return list.compactMap { m in
       guard let s = m["session"] as? String, let b = m["block"] as? String,
             let url = mark(title: m["title"] as? String ?? "") else { return nil }
@@ -239,11 +242,12 @@ enum Rex {
     }
   }
 
-  /// Read one line of `rex events --json`: the session whose layout it may change, and the mark if it is a marked
-  /// pane's title change. `cli` collects the CLI clients that have joined, as every rex call RexWeb makes does; any
-  /// other client connecting to a session or leaving it, such as the Rex app, can change which of its panes show.
-  static func event(_ line: Data, cli: inout Set<String>) -> (session: String?, mark: Mark?) {
-    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return (nil, nil) }
+  /// Read one line of `rex events --json`: the session whose layout it may change, and, if it is a title change, the
+  /// mark when the new title is marked, or else the block whose title isn't. `cli` collects the CLI clients that have
+  /// joined, as every rex call RexWeb makes does; any other client connecting to a session or leaving it, such as the
+  /// Rex app, can change which of its panes show.
+  static func event(_ line: Data, cli: inout Set<String>) -> (session: String?, mark: Mark?, unmarked: String?) {
+    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return (nil, nil, nil) }
     let p = o["payload"] as? [String: Any] ?? [:]
     switch o["type"] as? String {
     case "client_joined":
@@ -252,25 +256,24 @@ enum Rex {
     case "client_left":
       if let id = p["client_id"] as? String { cli.remove(id) }
     case "session_destroyed":
-      return (p["session_id"] as? String, nil)
+      return (p["session_id"] as? String, nil, nil)
     case "session_event":
       guard let s = p["session_id"] as? String, let e = p["event"] as? [String: Any] else { break }
       let ep = e["payload"] as? [String: Any] ?? [:]
       switch e["type"] as? String {
       case "session_view_changed", "active_window_changed", "block_closed", "window_closed":
-        return (s, nil)
+        return (s, nil, nil)
       case "client_connected", "client_disconnected":
-        if !cli.contains(ep["client_id"] as? String ?? "") { return (s, nil) }
+        if !cli.contains(ep["client_id"] as? String ?? "") { return (s, nil, nil) }
       case "block_event":
-        if ep["name"] as? String == "title_changed", let b = ep["block_id"] as? String,
-           let url = mark(title: (ep["payload"] as? [String: Any])?["title"] as? String ?? "") {
-          return (nil, Mark(session: s, block: b, url: url))
-        }
+        guard ep["name"] as? String == "title_changed", let b = ep["block_id"] as? String else { break }
+        guard let url = mark(title: (ep["payload"] as? [String: Any])?["title"] as? String ?? "") else { return (nil, nil, b) }
+        return (nil, Mark(session: s, block: b, url: url), nil)
       default: break
       }
     default: break
     }
-    return (nil, nil)
+    return (nil, nil, nil)
   }
 
   static var version: String?
@@ -357,7 +360,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   let session: String
   /// The address of the Rex server that holds the pane, or nil for the local server.
   let host: String?
-  /// For a pane that `rexweb-remote hold` keeps, the last URL written to it; nil for a pane that registered itself.
+  /// For a pane adopted by its label and title, the last URL written to it; nil for a pane that registered itself.
   var reported: String?
   let window: OverlayWindow
   let web: WKWebView
@@ -489,7 +492,8 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     let label = String(title.prefix(80))
     if label != lastLabel {
       lastLabel = label
-      Rex.setLabel(block: id, session: session, host: host, host == nil ? label : "rexweb " + label)
+      // An adopted pane keeps the "rexweb" label prefix that lets a scan adopt it again after RexWeb restarts.
+      Rex.setLabel(block: id, session: session, host: host, reported == nil ? label : "rexweb " + label)
     }
   }
 
@@ -773,6 +777,12 @@ final class Tracker {
   var dirty = Set<String>()
   /// One `rex events` stream per server: "" for the local server, else a host's address.
   var streams: [String: Process] = [:]
+  /// Servers with a scan running, and those to scan again when it ends, keyed as `streams` is.
+  var scanning = Set<String>()
+  var rescan = Set<String>()
+  /// Per server, the blocks whose latest title event since its stream started was unmarked. A scan or label check
+  /// that finishes later may have read the old title, so it doesn't adopt them.
+  var unmarked: [String: Set<String>] = [:]
   var hosts = Set<String>()
   var rexWasActive = false
   var insets = RexChrome.read()
@@ -803,9 +813,10 @@ final class Tracker {
     }
   }
 
-  /// Stream a server's events: a layout change refreshes that session's panels, and on another host a marked,
-  /// labelled pane becomes a panel. Each time a host's stream starts, a scan adopts the marked panes already there.
-  /// Local panes register themselves through `rexweb-pane`.
+  /// Stream a server's events, the local server's and each host's alike: a layout change refreshes that session's
+  /// panels and rescans the server, a marked, labelled pane becomes a panel, and an adopted pane whose title loses
+  /// its mark loses its panel. Each time a stream starts, a scan adopts the marked panes already there and closes
+  /// the panels of panes that lost their mark meanwhile, as a Rex server restart leaves them.
   func startEvents(_ host: String?) {
     let p = Rex.process(["events", "--all", "--json"], host: host)
     let out = Pipe()
@@ -816,21 +827,30 @@ final class Tracker {
       let d = h.availableData
       if d.isEmpty { h.readabilityHandler = nil; return }
       buf.append(d)
-      var marks: [Rex.Mark] = [], sessions = Set<String>()
+      var marks: [Rex.Mark] = [], unmarked: [String] = [], sessions = Set<String>()
       while let nl = buf.firstIndex(of: 10) {
         let e = Rex.event(buf[buf.startIndex..<nl], cli: &cli)
         if let s = e.session { sessions.insert(s) }
-        if let m = e.mark, host != nil { marks.append(m) }
+        if let m = e.mark { marks.append(m) }
+        if let b = e.unmarked { unmarked.append(b) }
         buf = Data(buf[(nl + 1)...])
       }
       DispatchQueue.main.async {
-        for m in marks where App.shared.panels[m.block] == nil {
+        guard let self else { return }
+        for b in unmarked {
+          self.unmarked[host ?? "", default: []].insert(b)
+          if let p = App.shared.panels[b], p.host == host, p.reported != nil { App.shared.closePanel(b) }
+        }
+        for m in marks {
+          self.unmarked[host ?? ""]?.remove(m.block)
+          guard App.shared.panels[m.block] == nil else { continue }
           Rex.queue.async {
             guard Rex.labelled(m, host: host) else { return }
-            DispatchQueue.main.async { App.shared.adopt(m, host: host) }
+            DispatchQueue.main.async { if self.unmarked[host ?? ""]?.contains(m.block) != true { App.shared.adopt(m, host: host) } }
           }
         }
-        sessions.forEach { self?.refresh($0) }
+        sessions.forEach { self.refresh($0) }
+        if !sessions.isEmpty { self.scan(host) }
       }
     }
     let started = Date()
@@ -844,10 +864,28 @@ final class Tracker {
     }
     do { try p.run() } catch { log("events failed: \(error)"); return }
     streams[host ?? ""] = p
-    guard host != nil else { return }
+    unmarked[host ?? ""] = nil
+    scan(host)
+  }
+
+  /// Adopt the marked, labelled panes on `host`'s server, and close the adopted panels there whose panes the scan
+  /// no longer finds. One scan runs per server at a time; one asked for meanwhile runs when it ends.
+  func scan(_ host: String?) {
+    let key = host ?? ""
+    if scanning.contains(key) { rescan.insert(key); return }
+    scanning.insert(key)
+    let before = App.shared.panels.values.filter { $0.host == host && $0.reported != nil }.map(\.id)
     Rex.queue.async {
       let marks = Rex.scan(host: host)
-      DispatchQueue.main.async { marks.forEach { App.shared.adopt($0, host: host) } }
+      DispatchQueue.main.async {
+        self.scanning.remove(key)
+        if let marks {
+          let found = Set(marks.map(\.block))
+          before.filter { !found.contains($0) }.forEach(App.shared.closePanel)
+          marks.filter { self.unmarked[key]?.contains($0.block) != true }.forEach { App.shared.adopt($0, host: host) }
+        }
+        if self.rescan.remove(key) != nil { self.scan(host) }
+      }
     }
   }
 
@@ -874,18 +912,18 @@ final class Tracker {
         self.refreshing.remove(session)
         for (id, d) in shown { self.displayed[id] = d }
         for (id, g) in grids { self.grids[id] = g }
-        if let v { self.views[session] = v; self.reconcile(session) }
+        if let v { self.views[session] = v; self.reconcile(session, ids) }
         if self.dirty.remove(session) != nil { self.refresh(session) }
       }
     }
   }
 
-  func reconcile(_ session: String) {
+  /// Close the panels among `asked`, the ones a refresh read the view for, whose blocks the view no longer has. A
+  /// panel added while the refresh ran may be newer than the view, so it waits for the next one.
+  func reconcile(_ session: String, _ asked: [String]) {
     guard let v = views[session] else { return }
     let ids = Set(Tracker.allBlockIDs(v))
-    for p in App.shared.panels.values where p.session == session && !ids.contains(p.id) {
-      App.shared.closePanel(p.id)
-    }
+    asked.filter { !ids.contains($0) }.forEach(App.shared.closePanel)
   }
 
   static func allBlockIDs(_ v: [String: Any]) -> [String] {
@@ -1398,7 +1436,8 @@ final class App: NSObject, NSApplicationDelegate {
     p.close()
   }
 
-  /// Open a browser pane beside `p`. A pane on another host runs `rexweb-remote hold` there, from that host's PATH.
+  /// Open a browser pane beside `p`: a local one registers itself through `rexweb-pane`, and one on another host runs
+  /// `rexweb-remote hold` there, from that host's PATH.
   func openPane(beside p: Panel, url: String) {
     let pane = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/rexweb-pane").path
     let command = p.host == nil
@@ -1407,8 +1446,10 @@ final class App: NSObject, NSApplicationDelegate {
     Rex.async(["split", "-s", p.session, "-b", p.id, "--split=right"] + command, host: p.host)
   }
 
-  func add(id: String, session: String, host: String?, url: String) -> Panel {
+  @discardableResult
+  func add(id: String, session: String, host: String?, url: String, reported: String? = nil) -> Panel {
     let p = Panel(id: id, session: session, host: host)
+    p.reported = reported
     panels[id] = p
     tracker.refresh(session)
     if !url.isEmpty { p.load(url) }
@@ -1416,10 +1457,10 @@ final class App: NSObject, NSApplicationDelegate {
     return p
   }
 
-  /// Make a panel for a pane that `rexweb-remote hold` keeps, unless it has one.
+  /// Make a panel for a marked, labelled pane, unless it has one.
   func adopt(_ m: Rex.Mark, host: String?) {
     guard panels[m.block] == nil else { return }
-    add(id: m.block, session: m.session, host: host, url: m.url).reported = m.url
+    add(id: m.block, session: m.session, host: host, url: m.url, reported: m.url)
   }
 
   func resolve(_ raw: Any?) -> Panel? {
