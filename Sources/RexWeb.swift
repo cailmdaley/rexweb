@@ -695,7 +695,13 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
 
   func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-    let isPopup = windowFeatures.width != nil || windowFeatures.height != nil || navigationAction.navigationType == .other
+    let sizedPopup = windowFeatures.width != nil || windowFeatures.height != nil
+    if !sizedPopup, let url = navigationAction.request.url,
+       let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+      App.shared.openPane(beside: self, url: url.absoluteString)
+      return nil
+    }
+    let isPopup = sizedPopup || navigationAction.navigationType == .other
     if !isPopup {
       if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
       return nil
