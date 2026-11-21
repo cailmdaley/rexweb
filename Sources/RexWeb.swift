@@ -878,6 +878,8 @@ final class Tracker {
   /// Per server, the blocks whose latest title event since its stream started was unmarked. A scan or label check
   /// that finishes later may have read the old title, so it doesn't adopt them.
   var unmarked: [String: Set<String>] = [:]
+  /// Blocks whose label is being checked, so a terminal that keeps printing marked titles runs one check at a time.
+  var checking = Set<String>()
   var hosts = Set<String>()
   var rexWasActive = false
   var insets = RexChrome.read()
@@ -938,12 +940,16 @@ final class Tracker {
         }
         for m in marks {
           self.unmarked[host ?? ""]?.remove(m.block)
-          guard App.shared.panels[m.block] == nil else { continue }
+          guard App.shared.panels[m.block] == nil, self.checking.insert(m.block).inserted else { continue }
           Rex.queue.async {
-            guard let label = Rex.label(m, host: host) else { return }
-            var m = m
-            m.label = label
-            DispatchQueue.main.async { if self.unmarked[host ?? ""]?.contains(m.block) != true { App.shared.adopt(m, host: host) } }
+            let label = Rex.label(m, host: host)
+            DispatchQueue.main.async {
+              self.checking.remove(m.block)
+              guard let label, self.unmarked[host ?? ""]?.contains(m.block) != true else { return }
+              var m = m
+              m.label = label
+              App.shared.adopt(m, host: host)
+            }
           }
         }
         if !sessions.isEmpty && host == nil { self.scan(host) }
