@@ -247,32 +247,43 @@ enum Rex {
   return true
   """
 
+  /// The marked, labelled panes in every session, and the sessions that couldn't be read whole.
   static let scanScript = """
-  local out = {}
+  local marks, failed = {}, {}
   for _, s in ipairs(rex.call("session.list").sessions or {}) do
-    rex.session.attach{ session_id = s.session_id }
-    for _, b in ipairs((rex.call("session.list_blocks", { session_id = s.session_id }) or {}).blocks or {}) do
+    local id = s.session_id
+    local ok, blocks = pcall(function()
+      rex.session.attach{ session_id = id }
+      return (rex.call("session.list_blocks", { session_id = id }) or {}).blocks or {}
+    end)
+    if not ok then failed[#failed + 1] = id; blocks = {} end
+    for _, b in ipairs(blocks) do
       local l = b.label or ""
       if b.creator_name == "com.superlogical.terminal" and (l == "rexweb" or l:sub(1, 7) == "rexweb ") then
-        local t = (rex.call("block.method", { session_id = s.session_id, block_id = b.block_id, method = "title" }) or {}).title or ""
-        if t:sub(1, 7) == "rexweb " then out[#out + 1] = { session = s.session_id, block = b.block_id, title = t, label = b.label } end
+        local ok, r = pcall(rex.call, "block.method", { session_id = id, block_id = b.block_id, method = "title" })
+        local t = ok and (r or {}).title or ""
+        if not ok then failed[#failed + 1] = id
+        elseif t:sub(1, 7) == "rexweb " then marks[#marks + 1] = { session = id, block = b.block_id, title = t, label = l } end
       end
     end
   end
-  return out
+  return { marks = marks, failed = failed }
   """
 
-  /// Every marked, labelled pane on `host`, found in one rex process, or nil if the scan failed.
-  static func scan(host: String?) -> [Mark]? {
+  /// Every marked, labelled pane on `host`, found in one rex process, and the sessions the scan couldn't read whole,
+  /// whose panes it may have missed; or nil if the scan failed.
+  static func scan(host: String?) -> (marks: [Mark], failed: Set<String>)? {
+    // A JSON list is a result, and so is an empty object, which is how Lua writes an empty list.
+    func list(_ v: Any?) -> [Any]? { v as? [Any] ?? ((v as? [String: Any])?.isEmpty == true ? [] : nil) }
     guard let data = run(["do", "-e", scanScript, "--json"], host: host, deadline: deadline(host)),
-          let o = try? JSONSerialization.jsonObject(with: data) else { return nil }
-    // Lua writes an empty list as {}.
-    let list = o as? [[String: Any]] ?? []
-    return list.compactMap { m in
-      guard let s = m["session"] as? String, let b = m["block"] as? String,
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let found = list(o["marks"]), let failed = list(o["failed"]) else { return nil }
+    let marks: [Mark] = found.compactMap { any in
+      guard let m = any as? [String: Any], let s = m["session"] as? String, let b = m["block"] as? String,
             let url = mark(title: m["title"] as? String ?? "") else { return nil }
       return Mark(session: s, block: b, url: url, label: m["label"] as? String ?? "")
     }
+    return (marks, Set(failed.compactMap { $0 as? String }))
   }
 
   /// Read one line of `rex events --json`: the session whose layout it may change, and, if it is a title change, the
@@ -955,19 +966,22 @@ final class Tracker {
   }
 
   /// Adopt the marked, labelled panes on `host`'s server, and close the adopted panels there whose panes the scan
-  /// no longer finds. One scan runs per server at a time; one asked for meanwhile runs when it ends.
+  /// no longer finds, unless it couldn't read their session. A panel closed and adopted again while the scan ran is
+  /// newer than the scan, so it stays. One scan runs per server at a time; one asked for meanwhile runs when it ends.
   func scan(_ host: String?) {
     let key = host ?? ""
     if scanning.contains(key) { rescan.insert(key); return }
     scanning.insert(key)
-    let before = App.shared.panels.values.filter { $0.host == host && $0.reported != nil }.map(\.id)
+    let before = App.shared.panels.values.filter { $0.host == host && $0.reported != nil }
     Rex.queue.async {
-      let marks = Rex.scan(host: host)
+      let result = Rex.scan(host: host)
       DispatchQueue.main.async {
         self.scanning.remove(key)
-        if let marks {
+        if let (marks, failed) = result {
           let found = Set(marks.map(\.block))
-          before.filter { !found.contains($0) }.forEach(App.shared.closePanel)
+          for p in before where !found.contains(p.id) && !failed.contains(p.session) && App.shared.panels[p.id] === p {
+            App.shared.closePanel(p.id)
+          }
           marks.filter { self.unmarked[key]?.contains($0.block) != true }.forEach { App.shared.adopt($0, host: host) }
         }
         if self.rescan.remove(key) != nil { self.scan(host) }
