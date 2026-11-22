@@ -1239,19 +1239,24 @@ final class Tracker {
       kept.append(w)
     }
     if namesReadable { return (kept, []) }
-    // Without Screen Recording permission window titles are empty, so detect a centered palette/sheet window
-    // sitting strictly inside a larger Rex window behind it in stacking order.
+    // Without Screen Recording permission window titles are empty, so detect transient Rex overlays
+    // (centered palettes/sheets and smaller sidebar hover popovers) sitting in front of a larger Rex window.
     var rex: [RexWindow] = []
     var overlays: [RexWindow] = []
     for (i, w) in kept.enumerated() {
-      let isCenteredOverlay = windowSession[w.number] == nil
-        && w.bounds.width <= 700
+      let isOverlay = windowSession[w.number] == nil
         && kept[(i + 1)...].contains { bg in
-          bg.bounds.contains(w.bounds)
+          let isCentered = w.bounds.width <= 700
+            && bg.bounds.contains(w.bounds)
             && w.bounds.width < bg.bounds.width * 0.75
             && abs(w.bounds.midX - bg.bounds.midX) < 40
+          let isPopover = w.bounds.width <= 520
+            && w.bounds.height <= 600
+            && w.bounds.width < bg.bounds.width * 0.65
+            && bg.bounds.intersects(w.bounds)
+          return isCentered || isPopover
         }
-      if isCenteredOverlay { overlays.append(w) } else { rex.append(w) }
+      if isOverlay { overlays.append(w) } else { rex.append(w) }
     }
     return (rex, overlays)
   }
@@ -1336,16 +1341,15 @@ final class Tracker {
       let ins = insets
       let frac = place.rect
       guard let rw = window(for: p, place, v, rexWins, primaryHeight) else { hide(p); continue }
+      let (body, radius) = Tracker.body(frac, floating: place.floating, in: rw.bounds, ins)
       if let iRex = order.firstIndex(of: rw.number),
          overlays.contains(where: { ov in
            guard let iOv = order.firstIndex(of: ov.number) else { return false }
-           return iOv < iRex && ov.bounds.intersects(rw.bounds)
+           return iOv < iRex && ov.bounds.intersects(body)
          }) {
         hide(p)
         continue
       }
-
-      let (body, radius) = Tracker.body(frac, floating: place.floating, in: rw.bounds, ins)
       if let l = p.window.contentView?.layer, l.cornerRadius != CGFloat(radius) { l.cornerRadius = CGFloat(radius) }
       guard body.width > 20, body.height > 20 else { hide(p); continue }
       let x0 = (body.minX).rounded(.up), x1 = (body.maxX).rounded(.down)
