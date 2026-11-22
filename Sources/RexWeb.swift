@@ -755,9 +755,12 @@ final class Popup: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDelegat
   let web: WKWebView
   let window: NSWindow
   var onClose: (() -> Void)?
+  private var keyMonitor: Any?
 
   init(configuration: WKWebViewConfiguration, features: WKWindowFeatures, parent: NSWindow) {
-    let w = CGFloat(features.width?.doubleValue ?? 520), h = CGFloat(features.height?.doubleValue ?? 680)
+    let screen = (parent.screen ?? NSScreen.main)?.visibleFrame ?? parent.frame
+    let rawW = CGFloat(features.width?.doubleValue ?? 520), rawH = CGFloat(features.height?.doubleValue ?? 680)
+    let w = min(rawW, screen.width * 0.94), h = min(rawH, screen.height * 0.94)
     web = WKWebView(frame: NSRect(x: 0, y: 0, width: w, height: h), configuration: configuration)
     window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
                       styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
@@ -768,15 +771,27 @@ final class Popup: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDelegat
     web.uiDelegate = self
     web.navigationDelegate = self
     web.isInspectable = true
-    let pf = parent.frame
-    window.setFrameOrigin(NSPoint(x: pf.midX - w / 2, y: pf.midY - h / 2))
+    window.setFrameOrigin(NSPoint(x: screen.midX - w / 2, y: screen.midY - h / 2))
     window.level = .floating
     window.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
+    keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+      guard let self, self.window.isKeyWindow else { return e }
+      let m = e.modifierFlags.intersection([.command, .shift, .option, .control])
+      let c = e.charactersIgnoringModifiers?.lowercased() ?? ""
+      if e.keyCode == 53 || (m == .command && c == "w") {
+        self.window.close()
+        return nil
+      }
+      return e
+    }
   }
 
   func webViewDidClose(_ webView: WKWebView) { window.close() }
-  func windowWillClose(_ n: Notification) { onClose?() }
+  func windowWillClose(_ n: Notification) {
+    if let monitor = keyMonitor { NSEvent.removeMonitor(monitor); keyMonitor = nil }
+    onClose?()
+  }
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { window.title = webView.title ?? "" }
 }
 
