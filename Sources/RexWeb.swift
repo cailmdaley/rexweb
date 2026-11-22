@@ -1757,8 +1757,15 @@ final class App: NSObject, NSApplicationDelegate {
       default: break
       }
     }
-    if m == [.command, .option], (123...126).contains(Int(e.keyCode)) {
-      forwardKeyToRex(p, keyCode: e.keyCode, flags: [.maskCommand, .maskAlternate]); return true
+    if m == [.command, .option] {
+      if (123...126).contains(Int(e.keyCode)) {
+        forwardKeyToRex(p, keyCode: e.keyCode, flags: [.maskCommand, .maskAlternate]); return true
+      }
+      switch c {
+      case "[", "]", "1", "2", "t", "a", "s", "x", "n":
+        forwardKeyToRex(p, keyCode: e.keyCode, flags: [.maskCommand, .maskAlternate]); return true
+      default: break
+      }
     }
     if m == .control, e.keyCode == 48 || e.keyCode == 36 || e.keyCode == 76 {
       forwardKeyToRex(p, keyCode: e.keyCode, flags: .maskControl); return true
