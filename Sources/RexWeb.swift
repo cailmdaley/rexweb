@@ -14,7 +14,35 @@ struct Config {
   var fallbackBrowser = ""
   var linkTarget = "split"
   var rexBin = ""
+  var rewriteOrigins: [(from: String, to: String)] = []
   var configError: String?
+
+  private static func trimSlash(_ s: String) -> String {
+    var out = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    while out.hasSuffix("/") { out.removeLast() }
+    return out
+  }
+
+  private static func replacePrefix(_ raw: String, from: String, to: String) -> String? {
+    guard !from.isEmpty, raw.hasPrefix(from) else { return nil }
+    let rest = raw.dropFirst(from.count)
+    guard rest.isEmpty || rest.first == "/" || rest.first == "?" || rest.first == "#" else { return nil }
+    return to + rest
+  }
+
+  func rewrite(_ raw: String) -> String {
+    for rule in rewriteOrigins {
+      if let mapped = Config.replacePrefix(raw, from: rule.from, to: rule.to) { return mapped }
+    }
+    return raw
+  }
+
+  func unrewrite(_ raw: String) -> String {
+    for rule in rewriteOrigins {
+      if let mapped = Config.replacePrefix(raw, from: rule.to, to: rule.from) { return mapped }
+    }
+    return raw
+  }
 
   static let dir = ProcessInfo.processInfo.environment["REXWEB_DIR"].map { URL(fileURLWithPath: $0) }
     ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".rexweb")
@@ -55,6 +83,12 @@ struct Config {
     if let f = o["fallback_browser"] as? String { c.fallbackBrowser = f }
     if let t = o["links"] as? String {
       if ["tab", "split"].contains(t) { c.linkTarget = t } else { c.configError = "links must be \"split\" or \"tab\"" }
+    }
+    if let r = o["rewrite_origins"] as? [String: String] {
+      c.rewriteOrigins = r
+        .map { (from: Config.trimSlash($0.key), to: Config.trimSlash($0.value)) }
+        .filter { !$0.from.isEmpty && !$0.to.isEmpty }
+        .sorted { $0.from.count > $1.from.count }
     }
     return c
   }
@@ -601,10 +635,13 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     }
     // An adopted pane hears each http or https address the page goes to. Any other address isn't one a marked
     // title can hold, so the pane keeps the last one it heard.
-    if let r = reported, let u = web.url, u.absoluteString != r, ["http", "https"].contains(u.scheme?.lowercased()) {
-      reported = u.absoluteString
-      Rex.async(["do", "-e", Rex.writeBackScript, "--args",
-                 Rex.json(["session": session, "block": id, "url": u.absoluteString])], host: host, deadline: Rex.deadline(host))
+    if let r = reported, let u = web.url, ["http", "https"].contains(u.scheme?.lowercased()) {
+      let external = config.unrewrite(u.absoluteString)
+      if external != r {
+        reported = external
+        Rex.async(["do", "-e", Rex.writeBackScript, "--args",
+                   Rex.json(["session": session, "block": id, "url": external])], host: host, deadline: Rex.deadline(host))
+      }
     }
     guard let title = (web.title?.isEmpty == false ? web.title : web.url?.host), !title.isEmpty else { return }
     let label = String(title.prefix(80))
@@ -627,7 +664,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   }
 
   static func normalize(_ raw: String) -> URL? {
-    let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let s = config.rewrite(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     if s.isEmpty { return nil }
     if s.contains("://") || s.hasPrefix("about:") || s.hasPrefix("data:") { return URL(string: s) }
     if s.hasPrefix("localhost") || s.hasPrefix("127.") || s.hasPrefix("[::1]") || s.range(of: #"^\d+$"#, options: .regularExpression) != nil {
@@ -1800,9 +1837,10 @@ final class App: NSObject, NSApplicationDelegate {
   /// `rexweb-remote hold` there, from that host's PATH.
   func openPane(beside p: Panel, url: String) {
     let pane = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/rexweb-pane").path
+    let remoteURL = config.unrewrite(url)
     let command = p.host == nil
       ? ["--label", "browser", "--shell=none", "--", "env", "REXWEB_FOCUS=true", pane, url]
-      : ["--label", "rexweb", "--", "rexweb-remote", "hold", url]
+      : ["--label", "rexweb", "--", "rexweb-remote", "hold", remoteURL]
     Rex.async(["split", "-s", p.session, "-b", p.id, "--split=down"] + command, host: p.host)
   }
 
