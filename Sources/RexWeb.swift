@@ -1209,10 +1209,14 @@ final class Tracker {
       if layer == 0 {
         allRex.insert(n)
         if !name.isEmpty { namesReadable = true }
-        guard r.width > 200, r.height > 200 else { continue }
+        guard r.width > 200, r.height >= 60 else { continue }
+        if r.height <= 200 {
+          overlays.append(RexWindow(number: n, name: name, bounds: r))
+          continue
+        }
         if !name.isEmpty, isAuxiliaryWindowName(name) { continue }
         candidates.append(RexWindow(number: n, name: name, bounds: r))
-      } else if layer > 0 && layer <= 101, r.width > 200, r.height > 150 {
+      } else if layer > 0 && layer <= 101, r.width > 200, r.height >= 60 {
         allRex.insert(n)
         overlays.append(RexWindow(number: n, name: name, bounds: r))
       }
