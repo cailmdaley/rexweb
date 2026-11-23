@@ -507,6 +507,8 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   /// Whether an adopted pane's label follows the page title: when it was adopted labelled just "rexweb", or with a
   /// label RexWeb gave it.
   var retitles = false
+  /// Whether the pane holds a page its creator placed and labelled, such as Shuttle's, rather than a browser.
+  var held: Bool { reported != nil && !retitles }
   let window: OverlayWindow
   let web: WKWebView
   let bar = NSView()
@@ -735,8 +737,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     let sizedPopup = windowFeatures.width != nil || windowFeatures.height != nil
     if !sizedPopup, let url = navigationAction.request.url,
        let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
-      // An adopted pane is a page its creator placed there, not a browser: its links to other sites open in the default one.
-      if reported != nil, Links.anotherSite(url, than: web.url) {
+      if held, Links.anotherSite(url, than: web.url) {
         Links.openOutside(url)
       } else {
         App.shared.openPane(beside: self, url: url.absoluteString)
@@ -748,7 +749,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
       if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
       return nil
     }
-    let popup = Popup(configuration: configuration, features: windowFeatures, parent: window, held: reported != nil)
+    let popup = Popup(configuration: configuration, features: windowFeatures, parent: window, held: held)
     popup.onClose = { [weak self, weak popup] in self?.popups.removeAll { $0 === popup } }
     popups.append(popup)
     return popup.web
@@ -756,7 +757,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
 
   func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-    if reported != nil, Links.handOff(navigationAction) { decisionHandler(.cancel); return }
+    if held, Links.handOff(navigationAction) { decisionHandler(.cancel); return }
     if navigationAction.modifierFlags.contains(.command), let url = navigationAction.request.url,
        navigationAction.navigationType == .linkActivated {
       App.shared.openPane(beside: self, url: url.absoluteString)
@@ -798,7 +799,7 @@ final class Popup: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDelegat
   let web: WKWebView
   let window: NSWindow
   var onClose: (() -> Void)?
-  /// Whether an adopted pane opened it: its links leave for the apps that own them, as that pane's do.
+  /// Whether a held page opened it: its links leave for the browser and other apps, as that page's do.
   private let held: Bool
   private var keyMonitor: Any?
 

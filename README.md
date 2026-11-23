@@ -168,7 +168,9 @@ terminal title is `rexweb URL`, and draws the page over them. It takes only `htt
 The label is the part a program can't fake by printing a title. A pane
 labelled just `rexweb`, as `rexweb-remote` makes it, is relabelled `rexweb · `
 and then the page title, and keeps following the title; any other label, such
-as `rexweb shuttle`, is its creator's and stays as it is. From the Mac, `rexweb
+as `rexweb shuttle`, is its creator's and stays as it is. Such a page isn't a
+browser: its links to other sites open in your default browser, and links such
+as `mailto:` in the app that owns them. From the Mac, `rexweb
 ls` lists them with the others, and every `rexweb` command works on them. When
 you browse to another page, RexWeb writes its address back to the pane, so the
 link stays current and a restarted RexWeb reopens the page you were on.
