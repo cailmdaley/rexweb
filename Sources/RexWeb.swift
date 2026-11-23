@@ -735,7 +735,12 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     let sizedPopup = windowFeatures.width != nil || windowFeatures.height != nil
     if !sizedPopup, let url = navigationAction.request.url,
        let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
-      App.shared.openPane(beside: self, url: url.absoluteString)
+      // An adopted pane is a page its creator placed there, not a browser: its links to other sites open in the default one.
+      if reported != nil, Links.anotherSite(url, than: web.url) {
+        Links.openOutside(url)
+      } else {
+        App.shared.openPane(beside: self, url: url.absoluteString)
+      }
       return nil
     }
     let isPopup = sizedPopup || navigationAction.navigationType == .other
@@ -743,7 +748,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
       if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
       return nil
     }
-    let popup = Popup(configuration: configuration, features: windowFeatures, parent: window)
+    let popup = Popup(configuration: configuration, features: windowFeatures, parent: window, held: reported != nil)
     popup.onClose = { [weak self, weak popup] in self?.popups.removeAll { $0 === popup } }
     popups.append(popup)
     return popup.web
@@ -751,6 +756,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
 
   func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    if reported != nil, Links.handOff(navigationAction) { decisionHandler(.cancel); return }
     if navigationAction.modifierFlags.contains(.command), let url = navigationAction.request.url,
        navigationAction.navigationType == .linkActivated {
       App.shared.openPane(beside: self, url: url.absoluteString)
@@ -792,9 +798,12 @@ final class Popup: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDelegat
   let web: WKWebView
   let window: NSWindow
   var onClose: (() -> Void)?
+  /// Whether an adopted pane opened it: its links leave for the apps that own them, as that pane's do.
+  private let held: Bool
   private var keyMonitor: Any?
 
-  init(configuration: WKWebViewConfiguration, features: WKWindowFeatures, parent: NSWindow) {
+  init(configuration: WKWebViewConfiguration, features: WKWindowFeatures, parent: NSWindow, held: Bool) {
+    self.held = held
     let screen = (parent.screen ?? NSScreen.main)?.visibleFrame ?? parent.frame
     let rawW = CGFloat(features.width?.doubleValue ?? 520), rawH = CGFloat(features.height?.doubleValue ?? 680)
     let w = min(rawW, screen.width * 0.94), h = min(rawH, screen.height * 0.94)
@@ -822,6 +831,19 @@ final class Popup: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDelegat
       }
       return e
     }
+  }
+
+  func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+               for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+    if held, let url = navigationAction.request.url, ["http", "https"].contains(url.scheme?.lowercased()) {
+      Links.openOutside(url)
+    }
+    return nil
+  }
+
+  func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+               decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    decisionHandler(held && Links.handOff(navigationAction) ? .cancel : .allow)
   }
 
   func webViewDidClose(_ webView: WKWebView) { window.close() }
@@ -1630,6 +1652,28 @@ enum Links {
     NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
   }
 
+  /// Schemes WebKit loads itself. A link to any other belongs to the app that owns it, such as mail.
+  static let webSchemes: Set<String> = ["http", "https", "about", "blob", "data", "file", "javascript"]
+
+  /// Hand a clicked link to the app that owns its scheme. False when WebKit loads it.
+  static func handOff(_ action: WKNavigationAction) -> Bool {
+    guard action.navigationType == .linkActivated, let url = action.request.url,
+          let scheme = url.scheme?.lowercased(), !webSchemes.contains(scheme) else { return false }
+    NSWorkspace.shared.open(url)
+    return true
+  }
+
+  /// Open a web link in the default browser, which RexWeb itself may be.
+  static func openOutside(_ url: URL) {
+    let current = NSWorkspace.shared.urlForApplication(toOpen: url).flatMap { Bundle(url: $0)?.bundleIdentifier }
+    if current == selfID { forward(url) } else { NSWorkspace.shared.open(url) }
+  }
+
+  static func anotherSite(_ url: URL, than page: URL?) -> Bool {
+    let to = URL(string: config.rewrite(url.absoluteString)) ?? url
+    return to.scheme != page?.scheme || to.host != page?.host || to.port != page?.port
+  }
+
   static func frontRexSession() -> String? {
     guard let win = Tracker.rexWindows().rex.first else { return nil }
     guard let data = Rex.run(["ls", "--json"]),
@@ -1856,7 +1900,7 @@ final class App: NSObject, NSApplicationDelegate {
     let command = p.host == nil
       ? ["--label", "browser", "--shell=none", "--", "env", "REXWEB_FOCUS=true", pane, url]
       : ["--label", "rexweb", "--", "rexweb-remote", "hold", remoteURL]
-    Rex.async(["split", "-s", p.session, "-b", p.id, "--split=down"] + command, host: p.host)
+    Rex.async(["split", "-s", p.session, "-b", p.id, "--split=below"] + command, host: p.host)
   }
 
   @discardableResult
