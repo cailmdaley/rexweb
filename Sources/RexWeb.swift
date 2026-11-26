@@ -510,7 +510,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   /// Whether the pane holds a page its creator placed and labelled, such as Shuttle's, rather than a browser.
   var held: Bool { reported != nil && !retitles }
   let window: OverlayWindow
-  let web: WKWebView
+  var web: WKWebView
   let bar = NSView()
   let urlField = NSTextField()
   let backButton = NSButton()
@@ -527,20 +527,34 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   var yieldFocusUntil = Date.distantPast
   var pendingFocus = false
   var focusURLWhenShown = false
+  var closed = false
+  private var probing = false
+  private var renderFailures = 0
+  private var lastHealthyAt = Date.distantPast
+  private var lastRecreatedAt = Date.distantPast
+  private var lastTerminatedAt = Date.distantPast
 
   static let barHeight: CGFloat = 30
   static let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: "6F1C0D2A-9C3B-4E55-9B7A-5E3B0AEB0001")!)
 
-  init(id: String, session: String, host: String?) {
-    self.id = id
-    self.session = session
-    self.host = host
+  private static func makeWebView() -> WKWebView {
     let conf = WKWebViewConfiguration()
     conf.websiteDataStore = Panel.store
     conf.applicationNameForUserAgent = "Version/26.4 Safari/605.1.15"
     conf.preferences.isElementFullscreenEnabled = true
     conf.allowsAirPlayForMediaPlayback = true
-    web = WKWebView(frame: .zero, configuration: conf)
+    let w = WKWebView(frame: .zero, configuration: conf)
+    w.isInspectable = true
+    w.allowsMagnification = true
+    w.autoresizingMask = [.width, .height]
+    return w
+  }
+
+  init(id: String, session: String, host: String?) {
+    self.id = id
+    self.session = session
+    self.host = host
+    web = Panel.makeWebView()
     window = OverlayWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
                            styleMask: [.borderless], backing: .buffered, defer: false)
     super.init()
@@ -558,11 +572,6 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     root.layer?.masksToBounds = true
     root.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
     window.contentView = root
-
-    web.navigationDelegate = self
-    web.uiDelegate = self
-    web.isInspectable = true
-    web.allowsMagnification = true
 
     for (b, sym, tip, sel) in [(backButton, "chevron.left", "Back", #selector(goBack)),
                                (forwardButton, "chevron.right", "Forward", #selector(goForward)),
@@ -588,11 +597,9 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
 
     bar.autoresizingMask = [.width, .minYMargin]
     urlField.autoresizingMask = [.width]
-    web.autoresizingMask = [.width, .height]
 
     root.addSubview(bar)
-    root.addSubview(web)
-    layout()
+    attachWeb(web)
     window.onSidebarSwipe = { [weak self] in
       guard let self else { return }
       Rex.async(["do", "-e", Rex.performActionScript, "--args",
@@ -606,11 +613,90 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
       self.lastActive = Date()
       Rex.async(["focus", "-s", self.session, self.id], host: self.host)
     }
-    web.addObserver(self, forKeyPath: "title", options: .new, context: nil)
-    web.addObserver(self, forKeyPath: "URL", options: .new, context: nil)
-    web.addObserver(self, forKeyPath: "canGoBack", options: .new, context: nil)
-    web.addObserver(self, forKeyPath: "canGoForward", options: .new, context: nil)
     updateChrome()
+  }
+
+  private func attachWeb(_ w: WKWebView) {
+    w.navigationDelegate = self
+    w.uiDelegate = self
+    for k in ["title", "URL", "canGoBack", "canGoForward"] { w.addObserver(self, forKeyPath: k, options: .new, context: nil) }
+    window.contentView?.addSubview(w)
+    layout()
+  }
+
+  private func detachWeb(_ w: WKWebView) {
+    for k in ["title", "URL", "canGoBack", "canGoForward"] { w.removeObserver(self, forKeyPath: k) }
+    w.navigationDelegate = nil
+    w.uiDelegate = nil
+    w.stopLoading()
+    w.removeFromSuperview()
+  }
+
+  func recreateWebView(reason: String) {
+    guard !closed else { return }
+    let url = web.url?.absoluteString ?? requested?.absoluteString
+    let zoom = web.pageZoom
+    let wasKey = window.firstResponder === web
+    log("pane \(id.suffix(6)) recreating webview (\(reason))")
+    finishWaiters("recreating webview")
+    detachWeb(web)
+    web = Panel.makeWebView()
+    web.pageZoom = zoom
+    attachWeb(web)
+    if wasKey { window.makeFirstResponder(web) }
+    lastRecreatedAt = Date()
+    lastHealthyAt = .distantPast
+    renderFailures = 0
+    probing = false
+    if let url, !url.isEmpty { load(url) }
+    updateChrome()
+  }
+
+  func resetRenderProbe() { renderFailures = 0 }
+
+  /// Check that a visible panel's WebKit rendering backend still paints frames.
+  /// When WebKit's GPU process becomes unresponsive, existing WebContent processes can stay wedged
+  /// on a dead RemoteRenderingBackend without firing `webViewWebContentProcessDidTerminate`.
+  func probeRenderHealth() {
+    guard visible, !closed, !probing, !web.isLoading else { return }
+    guard web.url != nil || requested != nil else { return }
+    let now = Date()
+    if renderFailures == 0 && now.timeIntervalSince(lastHealthyAt) < 30 { return }
+    if now.timeIntervalSince(lastRecreatedAt) < 5 { return }
+    probing = true
+    let target = web
+    let cfg = WKSnapshotConfiguration()
+    cfg.rect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    var finished = false
+    let complete: (Bool, String?) -> Void = { [weak self] ok, detail in
+      guard !finished else { return }
+      finished = true
+      guard let self, !self.closed, self.web === target else { return }
+      self.probing = false
+      guard self.visible, !self.web.isLoading else { return }
+      if ok {
+        self.renderFailures = 0
+        self.lastHealthyAt = Date()
+        return
+      }
+      self.renderFailures += 1
+      log("pane \(self.id.suffix(6)) render probe failed (\(self.renderFailures)): \(detail ?? "unknown")")
+      if self.renderFailures == 1 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.probeRenderHealth() }
+        return
+      }
+      if Date().timeIntervalSince(self.lastRecreatedAt) < 60 {
+        App.shared.restartSelf(reason: "pane \(self.id.suffix(6)) still wedged after recreate (\(detail ?? "unknown"))")
+      } else {
+        self.recreateWebView(reason: detail ?? "render probe failed")
+      }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { complete(false, "snapshot timed out") }
+    target.takeSnapshot(with: cfg) { img, err in
+      if let err { complete(false, err.localizedDescription) }
+      else if img == nil { complete(false, "nil snapshot") }
+      else { complete(true, nil) }
+    }
   }
 
   func layout() {
@@ -723,6 +809,22 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failed(error) }
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failed(error) }
 
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    guard webView === web, !closed else { return }
+    let now = Date()
+    let delay = now.timeIntervalSince(lastTerminatedAt) < 5 ? 2.0 : 0.1
+    lastTerminatedAt = now
+    log("pane \(id.suffix(6)) web content terminated; reloading in \(delay)s")
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+      guard let self, !self.closed else { return }
+      if let url = self.web.url?.absoluteString ?? self.requested?.absoluteString, !url.isEmpty {
+        self.load(url)
+      } else {
+        self.web.reload()
+      }
+    }
+  }
+
   func failed(_ error: Error) {
     let e = error as NSError
     if e.domain == NSURLErrorDomain && e.code == NSURLErrorCancelled { return }
@@ -786,10 +888,11 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   }
 
   func close() {
+    closed = true
     popups.forEach { $0.window.close() }
     popups = []
     finishWaiters("closed")
-    for k in ["title", "URL", "canGoBack", "canGoForward"] { web.removeObserver(self, forKeyPath: k) }
+    detachWeb(web)
     window.orderOut(nil)
     window.close()
   }
@@ -853,6 +956,7 @@ final class Popup: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDelegat
     onClose?()
   }
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { window.title = webView.title ?? "" }
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { webView.reload() }
 }
 
 enum ChromeCookies {
@@ -982,6 +1086,7 @@ final class Tracker {
   var nonSessionWindows = Set<Int>()
   var settingsFrame: CGRect?
   var pendingPair: (Int, String)?
+  var focusedSession: String?
   /// Servers with a refresh running, and those to refresh again when it ends, keyed as `streams` is.
   var refreshing = Set<String>()
   var dirty = Set<String>()
@@ -1057,6 +1162,9 @@ final class Tracker {
     NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil,
                                            queue: .main) { [weak self] _ in self?.wake() }
     Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshAll() }
+    Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { _ in
+      for p in App.shared.panels.values where p.visible { p.probeRenderHealth() }
+    }
     Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.syncHosts() }
     startEvents(nil)
     syncHosts()
@@ -1397,8 +1505,12 @@ final class Tracker {
       if let iMine, let iRex, iMine < iRex {
         stacked = order[(iMine + 1)..<iRex].allSatisfy { ours.contains($0) }
       }
+      let wasVisible = p.visible
       if !p.visible || !stacked { p.window.order(.above, relativeTo: rw.number) }
       p.visible = true
+      if !wasVisible {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak p] in p?.probeRenderHealth() }
+      }
       if p.pendingFocus {
         p.pendingFocus = false
         if frontRex == rw.number { App.shared.focus(p) }
@@ -1414,10 +1526,9 @@ final class Tracker {
 
   /// Pair the front Rex window with the session Rex last focused, once two readings 0.2 s apart agree.
   func learnWindows(_ wins: [RexWindow]) {
-    guard rexActive, let front = wins.first,
-          let data = RexChrome.value("lastFocusedSession") as? Data,
-          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let session = o["sessionID"] as? String else { pendingPair = nil; return }
+    focusedSession = (RexChrome.value("lastFocusedSession") as? Data)
+      .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["sessionID"] as? String
+    guard rexActive, let front = wins.first, let session = focusedSession else { pendingPair = nil; return }
     // Don't steal a session from a Rex window that is still on screen and paired with it: opening a non-session
     // window (Settings, About, updater) brings it to the front without changing lastFocusedSession.
     if windowSession[front.number] == nil,
@@ -1441,6 +1552,7 @@ final class Tracker {
     let label = v["label"] as? String ?? ""
     if let w = rexWins.first(where: { !$0.name.isEmpty && ($0.name == label || $0.name.hasSuffix(" - \(label)")) }) { return w }
     if let w = rexWins.first(where: { windowSession[$0.number] == p.session }) { return w }
+    guard p.session == focusedSession else { return nil }
     let free = rexWins.filter { windowSession[$0.number] == nil }
     if free.count == 1 { return free[0] }
     guard free.count > 1, let g = grids[p.id] else { return nil }
@@ -1481,7 +1593,7 @@ final class Tracker {
   }
 
   func hide(_ p: Panel) {
-    if p.visible { p.window.orderOut(nil); p.visible = false }
+    if p.visible { p.window.orderOut(nil); p.visible = false; p.resetRenderProbe() }
   }
 }
 
@@ -1728,6 +1840,30 @@ final class App: NSObject, NSApplicationDelegate {
   var panels: [String: Panel] = [:]
   let tracker = Tracker()
   let server = Server()
+  private var restarting = false
+
+  /// Restart RexWeb in the background to recover from a wedged WebKit GPU process,
+  /// throttled to at most once every 2 minutes.
+  func restartSelf(reason: String) {
+    guard !restarting else { return }
+    let stamp = Config.dir.appendingPathComponent("last-auto-restart")
+    if let text = try? String(contentsOf: stamp, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+       let ts = Double(text), Date().timeIntervalSince1970 - ts < 120 {
+      log("skipping auto-restart (cooldown active): \(reason)")
+      return
+    }
+    restarting = true
+    log("restarting RexWeb: \(reason)")
+    try? String(Date().timeIntervalSince1970).write(to: stamp, atomically: true, encoding: .utf8)
+    let bundle = Bundle.main.bundlePath
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+    p.arguments = ["-c", "sleep 0.4; /usr/bin/open -g \"$1\"", "_", bundle]
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    try? p.run()
+    NSApp.terminate(nil)
+  }
 
   func applicationWillFinishLaunching(_ n: Notification) {
     NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURLEvent(_:reply:)),
